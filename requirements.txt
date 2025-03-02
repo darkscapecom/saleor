@@ -8,3 +8,4 @@ boto3
 celery
 django-storages
 django-redis
+dj-database-url
