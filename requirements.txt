@@ -34,3 +34,10 @@ django-templated-email
 django-webpack-loader
 sentry-sdk
 social-auth-app-django
+django-stubs
+django-stubs-ext
+types-pillow
+types-redis
+types-requests
+types-pytz
+types-python-dateutil
