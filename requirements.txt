@@ -3,7 +3,7 @@ uvicorn
 gunicorn
 psycopg2-binary
 redis
-pillow_avif
+pillow
 boto3
 celery
 django-storages
