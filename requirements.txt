@@ -41,3 +41,14 @@ types-redis
 types-requests
 types-pytz
 types-python-dateutil
+django-compressor
+django-mptt
+django-parler
+django-polymorphic
+django-fsm
+django-model-utils
+django-versatileimagefield
+djangorestframework
+drf-yasg
+graphene-django
+jaeger-client
