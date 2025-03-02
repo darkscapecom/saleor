@@ -13,7 +13,7 @@ django-cache-url
 pillow
 stripe
 pydantic
-graphql-core
+graphql-core==3.2.3
 graphql-relay
 pyjwt
 requests
