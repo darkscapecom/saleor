@@ -5,7 +5,7 @@ WORKDIR /app
 
 COPY . /app
 
-RUN apt-get update && apt-get install -y libavif13
+RUN apt-get update && apt-get install -y libavif-dev
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
