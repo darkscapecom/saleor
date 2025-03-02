@@ -3,3 +3,8 @@ uvicorn
 gunicorn
 psycopg2-binary
 redis
+pillow_avif
+boto3
+celery
+django-storages
+django-redis
