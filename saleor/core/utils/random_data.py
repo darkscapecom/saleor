@@ -8,6 +8,7 @@ import uuid
 from collections import defaultdict
 from decimal import Decimal
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -178,12 +179,19 @@ CATEGORY_IMAGES = {
 COLLECTION_IMAGES = {1: "summer.jpg", 2: "clothing.jpg", 3: "clothing.jpg"}
 
 
+def _safe_child_path(base_path: str | os.PathLike, *parts: str) -> Path:
+    base = Path(base_path).resolve(strict=True)
+    child = base.joinpath(*parts).resolve(strict=True)
+    child.relative_to(base)
+    return child
+
+
 @lru_cache
 def get_sample_data():
-    path = os.path.join(
+    path = _safe_child_path(
         settings.PROJECT_ROOT, "saleor", "static", "populatedb_data.json"
     )
-    with open(path, encoding="utf8") as f:
+    with path.open(encoding="utf8") as f:
         db_items = json.load(f)
     types = defaultdict(list)
     # Sort db objects by its model
@@ -1831,8 +1839,8 @@ def get_product_list_images_dir(placeholder_dir):
 
 
 def get_image(image_dir, image_name):
-    img_path = os.path.join(image_dir, image_name)
-    return File(open(img_path, "rb"), name=image_name)
+    img_path = _safe_child_path(image_dir, image_name)
+    return File(img_path.open("rb"), name=image_name)
 
 
 def prepare_checkout_info():

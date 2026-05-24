@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from email.headerregistry import Address
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import dateutil.parser
@@ -420,7 +421,9 @@ def get_default_email_template(
     template_file_name: str, default_template_path: str
 ) -> str:
     """Get default template."""
-    default_template_path = os.path.join(default_template_path, template_file_name)
-    with open(default_template_path) as f:
+    template_dir = Path(default_template_path).resolve(strict=True)
+    template_path = (template_dir / template_file_name).resolve(strict=True)
+    template_path.relative_to(template_dir)
+    with template_path.open(encoding="utf-8") as f:
         template_str = f.read()
         return template_str
