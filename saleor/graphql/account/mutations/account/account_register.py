@@ -2,6 +2,7 @@ import graphene
 from django.conf import settings
 from django.contrib.auth import password_validation
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 
 from .....account import models
 from .....account.error_codes import AccountErrorCode
@@ -13,10 +14,10 @@ from ....channel.utils import clean_channel
 from ....core import ResolveInfo
 from ....core.doc_category import DOC_CATEGORY_USERS
 from ....core.enums import LanguageCodeEnum
-from ....core.mutations import ModelMutation
+from ....core.mutations import DeprecatedModelMutation
 from ....core.types import AccountError, NonNullList
 from ....core.utils import WebhookEventInfo
-from ....meta.inputs import MetadataInput
+from ....meta.inputs import MetadataInput, MetadataInputDescription
 from ....site.dataloaders import get_site_promise
 from ...types import User
 from .base import AccountBaseInput
@@ -39,7 +40,9 @@ class AccountRegisterInput(AccountBaseInput):
     )
     metadata = NonNullList(
         MetadataInput,
-        description="User public metadata.",
+        description=(
+            f"User public metadata. {MetadataInputDescription.PUBLIC_METADATA_INPUT}"
+        ),
         required=False,
     )
     channel = graphene.String(
@@ -54,7 +57,16 @@ class AccountRegisterInput(AccountBaseInput):
         doc_category = DOC_CATEGORY_USERS
 
 
-class AccountRegister(ModelMutation):
+class AccountRegister(DeprecatedModelMutation):
+    user = graphene.Field(
+        User,
+        deprecation_reason=(
+            "The field always returns a `User` object constructed from the input data. "
+            "The `user.id` is always empty. To determine whether the user exists "
+            "in Saleor, query via an external app with the required permissions."
+        ),
+    )
+
     class Arguments:
         input = AccountRegisterInput(
             description="Fields required to create a user.", required=True
@@ -99,14 +111,11 @@ class AccountRegister(ModelMutation):
         )
         # we don't want to return id's as it will allow to deduce if user exists
         if response.user:
-            response.user.RETURN_ID_IN_API_RESPONSE = False
+            response.user.NEWLY_CREATED_USER = True
         return response
 
-    @classmethod
-    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
-        site = get_site_promise(info.context).get()
-        if not site.settings.enable_account_confirmation_by_email:
-            return super().clean_input(info, instance, data, **kwargs)
+    @staticmethod
+    def clean_redirect_url(data: dict) -> None:
         if not data.get("redirect_url"):
             raise ValidationError(
                 {
@@ -127,9 +136,16 @@ class AccountRegister(ModelMutation):
                 }
             ) from e
 
-        data["channel"] = clean_channel(
-            data.get("channel"), error_class=AccountErrorCode, allow_replica=False
-        ).slug
+    @classmethod
+    def clean_input(cls, info: ResolveInfo, instance, data, **kwargs):
+        site = get_site_promise(info.context).get()
+
+        if site.settings.enable_account_confirmation_by_email:
+            cls.clean_redirect_url(data)
+
+            data["channel"] = clean_channel(
+                data.get("channel"), error_class=AccountErrorCode, allow_replica=False
+            ).slug
 
         data["email"] = data["email"].lower()
 
@@ -161,27 +177,74 @@ class AccountRegister(ModelMutation):
         instance = models.User()
         data = data.get("input")
         cleaned_input = cls.clean_input(info, instance, data)
-        metadata_list = cleaned_input.pop("metadata", None)
-        private_metadata_list = cleaned_input.pop("private_metadata", None)
+        metadata_list: list[MetadataInput] = cleaned_input.pop("metadata", None)
+        private_metadata_list: list[MetadataInput] = cleaned_input.pop(
+            "private_metadata", None
+        )
+
+        metadata_collection = cls.create_metadata_from_graphql_input(
+            metadata_list, error_field_name="metadata"
+        )
+        private_metadata_collection = cls.create_metadata_from_graphql_input(
+            private_metadata_list, error_field_name="private_metadata"
+        )
 
         instance = cls.construct_instance(instance, cleaned_input)
-        cls.validate_and_update_metadata(instance, metadata_list, private_metadata_list)
+
+        cls.validate_and_update_metadata(
+            instance, metadata_collection, private_metadata_collection
+        )
+
         user_exists = cls.clean_instance(info, instance)
+
         context_data = RequestorAwareContext.create_context_data(info.context)
         cls.save_and_create_task(user_exists, instance, cleaned_input, context_data)
+
+        # Sets updated_at, to always return the time when mutation was called
+        instance.updated_at = instance.date_joined
         return cls.success_response(instance)
 
     @classmethod
+    def _save(cls, instance: models.User) -> bool:
+        """Save a user instance with thread-race error handling.
+
+        This method attempts to save a User instance and handles possible thread race
+        that may occur due to unique constraint violations on the email field.
+
+        To keep the timing of the logic similar, the number of DB queries is the same
+        in both cases.
+        Return true when instance is saved. Return false otherwise.
+        """
+        try:
+            with transaction.atomic():
+                instance.save()
+            models.User.objects.filter(email=instance.email).first()
+            return True
+        except IntegrityError:
+            try:
+                models.User.objects.get(email=instance.email)
+                return False
+            except models.User.DoesNotExist:
+                pass
+            raise
+
+    @classmethod
     def save_and_create_task(cls, user_exists, instance, cleaned_input, context_data):
-        instance.set_password(cleaned_input["password"])
+        instance.set_password(
+            # nosemgrep: python.django.security.audit.unvalidated-password.unvalidated-password
+            # Password is being validated via cls.clean_input(), which correctly invokes
+            # django.contrib.auth.password_validation.validate_password()
+            cleaned_input["password"]
+        )
         instance.is_confirmed = False
 
+        user_created = False
         if not user_exists:
-            instance.save()
+            user_created = cls._save(instance)
 
         # moving logic to async task to prevent timing attacks
         finish_creating_user.delay(
-            instance.pk if not user_exists else None,
+            instance.pk if user_created else None,
             cleaned_input.get("redirect_url"),
             cleaned_input.get("channel"),
             context_data,

@@ -1,9 +1,7 @@
-import copy
-
 import pytest
+from django.utils import timezone
 
 from ...app.models import App
-from ...payment.interface import PaymentGateway
 from ..event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ..models import Webhook
 from ..observability.exceptions import (
@@ -12,16 +10,14 @@ from ..observability.exceptions import (
     TruncationError,
 )
 from ..observability.payload_schema import ObservabilityEventTypes
-from ..transport.list_stored_payment_methods import (
-    get_credit_card_info,
-    get_list_stored_payment_methods_from_response,
-    get_payment_method_from_response,
-)
 from ..transport.utils import (
     generate_cache_key_for_webhook,
-    to_payment_app_id,
 )
-from ..utils import get_webhooks_for_event, get_webhooks_for_multiple_events
+from ..utils import (
+    get_webhooks_for_app_lifecycle_event,
+    get_webhooks_for_event,
+    get_webhooks_for_multiple_events,
+)
 
 
 @pytest.fixture
@@ -126,6 +122,152 @@ def test_get_webhook_for_event_not_returning_any_webhook_for_sync_event_types(
     assert set(webhooks) == {sync_webhook}
 
 
+@pytest.fixture
+def app_lifecycle_app_factory(db):
+    """Create an app + webhook subscribed to an app lifecycle event.
+
+    The created app intentionally does NOT hold MANAGE_APPS, mirroring how
+    third-party apps cannot grant themselves admin-only permissions.
+    """
+
+    def create_app(
+        event_type=WebhookEventAsyncType.APP_DELETED,
+        active_app=True,
+        active_webhook=True,
+        removed=False,
+    ):
+        app = App.objects.create(name="Lifecycle App", is_active=active_app)
+        app.tokens.create(name="Default")
+        if removed:
+            app.removed_at = timezone.now()
+            app.save(update_fields=["removed_at"])
+        webhook = Webhook.objects.create(
+            name="lifecycle-webhook", app=app, is_active=active_webhook
+        )
+        webhook.events.create(event_type=event_type)
+        return app, webhook
+
+    return create_app
+
+
+def test_app_lifecycle_returns_self_webhook_without_manage_apps(
+    app_lifecycle_app_factory,
+):
+    # given
+    affected_app, affected_webhook = app_lifecycle_app_factory()
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == {affected_webhook}
+
+
+def test_app_lifecycle_does_not_leak_to_other_apps(app_lifecycle_app_factory):
+    # given
+    affected_app, _ = app_lifecycle_app_factory()
+    _, other_webhook = app_lifecycle_app_factory()
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert other_webhook not in set(webhooks)
+
+
+def test_app_lifecycle_ignores_manage_apps_holders(
+    app_lifecycle_app_factory, permission_manage_apps
+):
+    """An admin app with MANAGE_APPS must not receive events about other apps."""
+
+    # given
+    affected_app, affected_webhook = app_lifecycle_app_factory()
+    admin_app, admin_webhook = app_lifecycle_app_factory()
+    admin_app.permissions.add(permission_manage_apps)
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == {affected_webhook}
+    assert admin_webhook not in set(webhooks)
+
+
+def test_app_lifecycle_includes_soft_deleted_app(app_lifecycle_app_factory):
+    # given
+    affected_app, affected_webhook = app_lifecycle_app_factory(removed=True)
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == {affected_webhook}
+
+
+def test_app_lifecycle_includes_inactive_app(app_lifecycle_app_factory):
+    # given
+    affected_app, affected_webhook = app_lifecycle_app_factory(
+        event_type=WebhookEventAsyncType.APP_STATUS_CHANGED, active_app=False
+    )
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_STATUS_CHANGED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == {affected_webhook}
+
+
+def test_app_lifecycle_excludes_inactive_webhook(app_lifecycle_app_factory):
+    # given
+    affected_app, _ = app_lifecycle_app_factory(active_webhook=False)
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == set()
+
+
+def test_app_lifecycle_matches_any_subscription(app_lifecycle_app_factory):
+    """A webhook subscribed via ANY must also receive lifecycle events."""
+
+    # given
+    affected_app, affected_webhook = app_lifecycle_app_factory(
+        event_type=WebhookEventAsyncType.ANY
+    )
+
+    # when
+    webhooks = get_webhooks_for_app_lifecycle_event(
+        WebhookEventAsyncType.APP_DELETED, affected_app
+    )
+
+    # then
+    assert set(webhooks) == {affected_webhook}
+
+
+def test_app_lifecycle_rejects_non_lifecycle_event(app_lifecycle_app_factory):
+    # given
+    affected_app, _ = app_lifecycle_app_factory()
+
+    # when & then
+    with pytest.raises(ValueError, match="not an app lifecycle event"):
+        get_webhooks_for_app_lifecycle_event(
+            WebhookEventAsyncType.ORDER_CREATED, affected_app
+        )
+
+
 @pytest.mark.parametrize(
     ("error", "event_type"),
     [
@@ -225,24 +367,6 @@ def test_get_webhooks_for_multiple_events(
     }
 
 
-@pytest.fixture
-def payment_method_response():
-    return {
-        "id": "method-1",
-        "supportedPaymentFlows": ["INTERACTIVE"],
-        "type": "Credit Card",
-        "creditCardInfo": {
-            "brand": "visa",
-            "lastDigits": "1234",
-            "expMonth": 1,
-            "expYear": 2023,
-            "firstDigits": "123456",
-        },
-        "name": "***1234",
-        "data": {"some": "data"},
-    }
-
-
 def test_different_target_urls_produce_different_cache_key(checkout_with_item):
     # given
     target_url_1 = "http://example.com/1"
@@ -334,280 +458,3 @@ def test_different_app_produce_different_cache_key():
 
     # then
     assert cache_key_1 != cache_key_2
-
-
-def test_get_credit_card_info(app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_year = "2023"
-    exp_month = 1
-    first_digits = "4321"
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-        "firstDigits": first_digits,
-    }
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response.brand == brand
-    assert response.last_digits == last_digits
-    assert response.exp_year == int(exp_year)
-    assert response.exp_month == exp_month
-    assert response.first_digits == first_digits
-
-
-def test_get_credit_card_info_without_first_digits_field(app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_year = 2023
-    exp_month = 1
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-    }
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response.brand == brand
-    assert response.last_digits == last_digits
-    assert response.exp_year == exp_year
-    assert response.exp_month == exp_month
-    assert response.first_digits is None
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "brand",
-        "lastDigits",
-        "expYear",
-        "expMonth",
-    ],
-)
-def test_get_credit_card_info_missing_required_field(field, app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_year = 2023
-    exp_month = 1
-    first_digits = "4321"
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-        "firstDigits": first_digits,
-    }
-    del credit_card_info[field]
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response is None
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "brand",
-        "lastDigits",
-        "expYear",
-        "expMonth",
-    ],
-)
-def test_get_credit_card_info_required_field_is_none(field, app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_year = 2023
-    exp_month = 1
-    first_digits = "4321"
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-        "firstDigits": first_digits,
-    }
-    credit_card_info[field] = None
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response is None
-
-
-@pytest.mark.parametrize("exp_year", [None, "", "str"])
-def test_get_credit_card_info_incorrect_exp_year(exp_year, app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_month = 1
-    first_digits = "4321"
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-        "firstDigits": first_digits,
-    }
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response is None
-
-
-@pytest.mark.parametrize("exp_month", [None, "", "str"])
-def test_get_credit_card_info_incorrect_exp_month(exp_month, app):
-    # given
-    brand = "VISA"
-    last_digits = "1234"
-    exp_year = 2023
-    first_digits = "4321"
-
-    credit_card_info = {
-        "brand": brand,
-        "lastDigits": last_digits,
-        "expYear": exp_year,
-        "expMonth": exp_month,
-        "firstDigits": first_digits,
-    }
-
-    # when
-    response = get_credit_card_info(app, credit_card_info)
-
-    # then
-    assert response is None
-
-
-def test_get_payment_method_from_response(payment_method_response, app):
-    # when
-    payment_method = get_payment_method_from_response(
-        app, payment_method_response, "usd"
-    )
-
-    # then
-    assert payment_method.id == to_payment_app_id(app, payment_method_response["id"])
-    assert payment_method.external_id == payment_method_response["id"]
-    assert payment_method.type == payment_method_response["type"]
-    assert payment_method.gateway == PaymentGateway(
-        id=app.identifier, name=app.name, currencies=["usd"], config=[]
-    )
-    assert payment_method.supported_payment_flows == [
-        flow.lower() for flow in payment_method_response["supportedPaymentFlows"]
-    ]
-    assert payment_method.credit_card_info == get_credit_card_info(
-        app, payment_method_response["creditCardInfo"]
-    )
-    assert payment_method.name == payment_method_response["name"]
-    assert payment_method.data == payment_method_response["data"]
-
-
-@pytest.mark.parametrize("field", ["id", "type", "supportedPaymentFlows"])
-def test_get_payment_method_from_response_missing_required_field(
-    field, payment_method_response, app
-):
-    # given
-    del payment_method_response[field]
-
-    # when
-    payment_method = get_payment_method_from_response(
-        app, payment_method_response, "usd"
-    )
-
-    # then
-    assert payment_method is None
-
-
-@pytest.mark.parametrize("field", ["creditCardInfo", "name", "data"])
-def test_get_payment_method_from_response_optional_field(
-    field, payment_method_response, app
-):
-    del payment_method_response[field]
-
-    # when
-    payment_method = get_payment_method_from_response(
-        app, payment_method_response, "usd"
-    )
-
-    # then
-    assert payment_method.id == to_payment_app_id(app, payment_method_response["id"])
-    assert payment_method.external_id == payment_method_response["id"]
-    assert payment_method.type == payment_method_response["type"]
-    assert payment_method.gateway == PaymentGateway(
-        id=app.identifier, name=app.name, currencies=["usd"], config=[]
-    )
-    assert payment_method.supported_payment_flows == [
-        flow.lower() for flow in payment_method_response["supportedPaymentFlows"]
-    ]
-
-
-@pytest.mark.parametrize("field", ["id", "type", "supportedPaymentFlows"])
-def test_get_payment_method_from_response_required_field_is_none(
-    field, payment_method_response, app
-):
-    # given
-    payment_method_response[field] = None
-
-    # when
-    payment_method = get_payment_method_from_response(
-        app, payment_method_response, "usd"
-    )
-
-    # then
-    assert payment_method is None
-
-
-def test_get_payment_method_from_response_incorrect_payment_flow_choices(
-    payment_method_response, app
-):
-    # given
-    payment_method_response["supportedPaymentFlows"] = ["incorrect", "INTERACTIVE"]
-
-    # when
-    payment_method = get_payment_method_from_response(
-        app, payment_method_response, "usd"
-    )
-
-    # then
-    assert payment_method is None
-
-
-def test_get_list_stored_payment_methods_from_response(payment_method_response, app):
-    # given
-    second_payment_method = copy.deepcopy(payment_method_response)
-    del second_payment_method["id"]
-    list_stored_payment_methods_response = {
-        "paymentMethods": [payment_method_response, second_payment_method]
-    }
-
-    # when
-    response = get_list_stored_payment_methods_from_response(
-        app, list_stored_payment_methods_response, "usd"
-    )
-
-    # then
-    assert len(response) == 1
-    assert response == [
-        get_payment_method_from_response(app, payment_method_response, "usd")
-    ]

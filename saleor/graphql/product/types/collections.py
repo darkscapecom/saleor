@@ -4,30 +4,36 @@ import graphene
 from graphene import relay
 from promise import Promise
 
+from ....core.search import prefix_search
 from ....permission.enums import ProductPermissions
 from ....product import models
-from ....product.search import search_products
 from ....thumbnail.utils import (
     get_image_or_proxy_url,
     get_thumbnail_format,
     get_thumbnail_size,
 )
-from ...channel import ChannelContext, ChannelQsContext
-from ...channel.dataloaders import ChannelBySlugLoader
-from ...channel.types import ChannelContextType
+from ...channel.dataloaders.by_self import ChannelBySlugLoader
 from ...core import ResolveInfo
 from ...core.connection import (
     CountableConnection,
     create_connection_slice,
     filter_connection_queryset,
 )
-from ...core.context import get_database_connection_name
-from ...core.descriptions import DEPRECATED_IN_3X_FIELD, RICH_CONTENT
+from ...core.context import (
+    ChannelContext,
+    ChannelQsContext,
+    get_database_connection_name,
+)
+from ...core.descriptions import DEPRECATED_IN_3X_INPUT, RICH_CONTENT
 from ...core.doc_category import DOC_CATEGORY_PRODUCTS
 from ...core.federation import federated_entity
 from ...core.fields import FilterConnectionField, JSONString, PermissionsField
 from ...core.types import Image, NonNullList, ThumbnailField
-from ...core.utils import from_global_id_or_error
+from ...core.types.context import ChannelContextType
+from ...core.utils import (
+    from_global_id_or_error,
+    validate_and_apply_search_rank_sorting,
+)
 from ...meta.types import ObjectWithMetadata
 from ...translations.fields import TranslationField
 from ...translations.types import CollectionTranslation
@@ -36,9 +42,8 @@ from ..dataloaders import (
     CollectionChannelListingByCollectionIdLoader,
     ThumbnailByCollectionIdSizeAndFormatLoader,
 )
-from ..filters import ProductFilterInput, ProductWhereInput
-from ..sorters import ProductOrder
-from ..utils import check_for_sorting_by_rank
+from ..filters.product import ProductFilterInput, ProductWhereInput
+from ..sorters import ProductOrder, ProductOrderField
 from .channels import CollectionChannelListing
 from .products import ProductCountableConnection
 
@@ -61,14 +66,18 @@ class Collection(ChannelContextType[models.Collection]):
     )
     description_json = JSONString(
         description="Description of the collection." + RICH_CONTENT,
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use the `description` field instead."
-        ),
+        deprecation_reason="Use the `description` field instead.",
     )
     products = FilterConnectionField(
         ProductCountableConnection,
-        filter=ProductFilterInput(description="Filtering options for products."),
-        where=ProductWhereInput(description="Filtering options for products."),
+        filter=ProductFilterInput(
+            description=(
+                f"Filtering options for products. {DEPRECATED_IN_3X_INPUT} "
+                "Use `where` filter instead."
+            )
+        ),
+        where=ProductWhereInput(description="Where filtering options for products."),
+        search=graphene.String(description="Search products."),
         sort_by=ProductOrder(description="Sort products."),
         description="List of products in this collection.",
     )
@@ -130,7 +139,9 @@ class Collection(ChannelContextType[models.Collection]):
     def resolve_products(
         root: ChannelContext[models.Collection], info: ResolveInfo, **kwargs
     ):
-        check_for_sorting_by_rank(info, kwargs)
+        validate_and_apply_search_rank_sorting(
+            kwargs, ProductOrderField.RANK, "ProductOrder", info
+        )
         search = kwargs.get("search")
 
         requestor = get_user_or_app_from_context(info.context)
@@ -143,7 +154,7 @@ class Collection(ChannelContextType[models.Collection]):
 
             if search:
                 qs = ChannelQsContext(
-                    qs=search_products(qs.qs, search), channel_slug=root.channel_slug
+                    qs=prefix_search(qs, search), channel_slug=root.channel_slug
                 )
             else:
                 qs = ChannelQsContext(qs=qs, channel_slug=root.channel_slug)

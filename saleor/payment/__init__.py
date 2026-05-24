@@ -284,3 +284,24 @@ class TokenizedPaymentFlow:
     CHOICES = [
         (INTERACTIVE, "Interactive"),
     ]
+
+
+class PaymentMethodType:
+    """Represents possible payment method types.
+
+    The following types are possible:
+    CARD - represents a card payment method.
+    OTHER - represents any payment method that is not a card payment.
+    GIFT_CARD - represents a gift card payment method.
+
+    """
+
+    CARD = "card"
+    OTHER = "other"
+    GIFT_CARD = "gift_card"
+
+    CHOICES = [
+        (CARD, "Card"),
+        (OTHER, "Other"),
+        (GIFT_CARD, "Gift card"),
+    ]

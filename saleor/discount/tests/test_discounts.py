@@ -24,11 +24,11 @@ from ..utils.promotion import (
 )
 from ..utils.shared import discount_info_for_logs
 from ..utils.voucher import (
-    _get_the_cheapest_line,
     activate_voucher_code,
     add_voucher_usage_by_customer,
     deactivate_voucher_code,
     decrease_voucher_code_usage_value,
+    get_the_cheapest_line,
     increase_voucher_code_usage_value,
     is_order_level_voucher,
     remove_voucher_usage_by_customer,
@@ -109,7 +109,7 @@ def test_valid_voucher_min_checkout_items_quantity(voucher):
 def test_percentage_discounts(product, channel_USD, catalogue_promotion_without_rules):
     # given
     variant = product.variants.get()
-    reward_value = Decimal("50")
+    reward_value = Decimal(50)
     rule = catalogue_promotion_without_rules.rules.create(
         catalogue_predicate={
             "productPredicate": {
@@ -123,10 +123,10 @@ def test_percentage_discounts(product, channel_USD, catalogue_promotion_without_
     variant_channel_listing = variant.channel_listings.get(channel=channel_USD)
     variant_channel_listing.variantlistingpromotionrule.create(
         promotion_rule=rule,
-        discount_amount=Decimal("5"),
+        discount_amount=Decimal(5),
         currency=channel_USD.currency_code,
     )
-    price = Decimal("10")
+    price = Decimal(10)
 
     # when
     final_price = variant.get_price(
@@ -142,7 +142,7 @@ def test_percentage_discounts(product, channel_USD, catalogue_promotion_without_
 def test_fixed_discounts(product, channel_USD, catalogue_promotion_without_rules):
     # given
     variant = product.variants.get()
-    reward_value = Decimal("5")
+    reward_value = Decimal(5)
     rule = catalogue_promotion_without_rules.rules.create(
         catalogue_predicate={
             "productPredicate": {
@@ -156,10 +156,10 @@ def test_fixed_discounts(product, channel_USD, catalogue_promotion_without_rules
     variant_channel_listing = variant.channel_listings.get(channel=channel_USD)
     variant_channel_listing.variantlistingpromotionrule.create(
         promotion_rule=rule,
-        discount_amount=Decimal("1"),
+        discount_amount=Decimal(1),
         currency=channel_USD.currency_code,
     )
-    price = Decimal("10")
+    price = Decimal(10)
 
     # when
     final_price = variant.get_price(
@@ -231,6 +231,29 @@ def test_decrease_voucher_usage(channel_USD):
     decrease_voucher_code_usage_value(code_instance)
     code_instance.refresh_from_db(fields=["used"])
     assert code_instance.used == 9
+
+
+def test_decrease_voucher_usage_used_0(channel_USD):
+    # given
+    code = "unique"
+    voucher = Voucher.objects.create(
+        type=VoucherType.ENTIRE_ORDER,
+        discount_value_type=DiscountValueType.FIXED,
+        usage_limit=100,
+    )
+    code_instance = VoucherCode.objects.create(code=code, voucher=voucher, used=0)
+    VoucherChannelListing.objects.create(
+        voucher=voucher,
+        channel=channel_USD,
+        discount=Money(10, channel_USD.currency_code),
+    )
+
+    # when
+    decrease_voucher_code_usage_value(code_instance)
+
+    # then
+    code_instance.refresh_from_db(fields=["used"])
+    assert code_instance.used == 0
 
 
 def test_deactivate_voucher_code(voucher):
@@ -648,7 +671,7 @@ def test_is_order_level_voucher_another_type(voucher_type, voucher):
 
 def test_get_the_cheapest_line_no_lines_provided():
     # when
-    line_info = _get_the_cheapest_line(None)
+    line_info = get_the_cheapest_line(None)
     # then
     assert line_info is None
 
@@ -672,7 +695,7 @@ def test_get_the_cheapest_line(checkout_with_items, channel_USD):
         for line in checkout_with_items.lines.all()
     ]
     # when
-    line_info = _get_the_cheapest_line(lines)
+    line_info = get_the_cheapest_line(lines)
     # then
     assert line_info == lines[0]
 

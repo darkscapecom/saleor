@@ -4,12 +4,11 @@ from ...permission.enums import DiscountPermissions
 from ..core import ResolveInfo
 from ..core.connection import create_connection_slice, filter_connection_queryset
 from ..core.descriptions import (
-    DEPRECATED_IN_3X_FIELD,
     DEPRECATED_IN_3X_INPUT,
 )
 from ..core.doc_category import DOC_CATEGORY_DISCOUNTS
 from ..core.fields import FilterConnectionField, PermissionsField
-from ..core.types import FilterInputObjectType
+from ..core.filters import FilterInputObjectType
 from ..core.utils import from_global_id_or_error
 from ..translations.mutations import (
     PromotionRuleTranslate,
@@ -80,9 +79,7 @@ class DiscountQueries(graphene.ObjectType):
             description="Slug of a channel for which the data should be returned."
         ),
         description="Look up a sale by ID.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use the `promotion` query instead."
-        ),
+        deprecation_reason="Use the `promotion` query instead.",
         permissions=[
             DiscountPermissions.MANAGE_DISCOUNTS,
         ],
@@ -102,9 +99,7 @@ class DiscountQueries(graphene.ObjectType):
             description="Slug of a channel for which the data should be returned."
         ),
         description="List of the shop's sales.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use the `promotions` query instead."
-        ),
+        deprecation_reason="Use the `promotions` query instead.",
         permissions=[
             DiscountPermissions.MANAGE_DISCOUNTS,
         ],
@@ -156,7 +151,9 @@ class DiscountQueries(graphene.ObjectType):
     )
     promotions = FilterConnectionField(
         PromotionCountableConnection,
-        where=PromotionWhereInput(description="Where filtering options."),
+        where=PromotionWhereInput(
+            description="Where filtering options for promotions."
+        ),
         sort_by=PromotionSortingInput(description="Sort promotions."),
         description="List of the promotions.",
         permissions=[DiscountPermissions.MANAGE_DISCOUNTS],
@@ -216,14 +213,28 @@ class DiscountMutations(graphene.ObjectType):
     promotion_rule_translate = PromotionRuleTranslate.Field()
     promotion_bulk_delete = PromotionBulkDelete.Field()
 
-    sale_create = SaleCreate.Field()
-    sale_delete = SaleDelete.Field()
+    sale_create = SaleCreate.Field(
+        deprecation_reason="Use `promotionCreate` mutation instead."
+    )
+    sale_delete = SaleDelete.Field(
+        deprecation_reason="Use `promotionDelete` mutation instead."
+    )
     sale_bulk_delete = SaleBulkDelete.Field()
-    sale_update = SaleUpdate.Field()
-    sale_catalogues_add = SaleAddCatalogues.Field()
-    sale_catalogues_remove = SaleRemoveCatalogues.Field()
-    sale_translate = SaleTranslate.Field()
-    sale_channel_listing_update = SaleChannelListingUpdate.Field()
+    sale_update = SaleUpdate.Field(
+        deprecation_reason="Use `promotionUpdate` mutation instead."
+    )
+    sale_catalogues_add = SaleAddCatalogues.Field(
+        deprecation_reason="Use `promotionRuleCreate` and `promotionRuleUpdate` mutations instead."
+    )
+    sale_catalogues_remove = SaleRemoveCatalogues.Field(
+        deprecation_reason="Use `promotionRuleUpdate` and `promotionRuleDelete` mutations instead."
+    )
+    sale_translate = SaleTranslate.Field(
+        deprecation_reason="Use `promotionTranslate` mutation instead."
+    )
+    sale_channel_listing_update = SaleChannelListingUpdate.Field(
+        deprecation_reason="Use `promotionRuleUpdate` mutation instead."
+    )
 
     voucher_create = VoucherCreate.Field()
     voucher_delete = VoucherDelete.Field()

@@ -10,10 +10,11 @@ from ..core.connection import (
     create_connection_slice_for_sync_webhook_control_context,
     filter_connection_queryset,
 )
-from ..core.descriptions import DEPRECATED_IN_3X_FIELD, DEPRECATED_IN_3X_INPUT
+from ..core.descriptions import DEPRECATED_IN_3X_INPUT
 from ..core.doc_category import DOC_CATEGORY_CHECKOUT
 from ..core.fields import BaseField, ConnectionField, FilterConnectionField
 from ..core.scalars import UUID
+from ..core.utils import validate_and_apply_search_rank_sorting
 from ..payment.mutations import CheckoutPaymentCreate
 from .filters import CheckoutFilterInput
 from .mutations import (
@@ -25,6 +26,7 @@ from .mutations import (
     CheckoutCustomerAttach,
     CheckoutCustomerDetach,
     CheckoutCustomerNoteUpdate,
+    CheckoutDelete,
     CheckoutDeliveryMethodUpdate,
     CheckoutEmailUpdate,
     CheckoutLanguageCodeUpdate,
@@ -38,7 +40,7 @@ from .mutations import (
     OrderCreateFromCheckout,
 )
 from .resolvers import resolve_checkout, resolve_checkout_lines, resolve_checkouts
-from .sorters import CheckoutSortingInput
+from .sorters import CheckoutSortField, CheckoutSortingInput
 from .types import (
     Checkout,
     CheckoutCountableConnection,
@@ -77,12 +79,20 @@ class CheckoutQueries(graphene.ObjectType):
             CheckoutPermissions.MANAGE_CHECKOUTS,
             PaymentPermissions.HANDLE_PAYMENTS,
         ],
-        description="List of checkouts.",
+        description=(
+            "List of checkouts. The query will not initiate any external requests, "
+            "including fetching external shipping methods, filtering available "
+            "shipping methods, or performing external tax calculations."
+        ),
         doc_category=DOC_CATEGORY_CHECKOUT,
     )
     checkout_lines = ConnectionField(
         CheckoutLineCountableConnection,
-        description="List of checkout lines.",
+        description=(
+            "List of checkout lines. The query will not initiate any external "
+            "requests, including fetching external shipping methods, filtering "
+            "available shipping methods, or performing external tax calculations."
+        ),
         permissions=[
             CheckoutPermissions.MANAGE_CHECKOUTS,
         ],
@@ -95,6 +105,9 @@ class CheckoutQueries(graphene.ObjectType):
 
     @staticmethod
     def resolve_checkouts(_root, info: ResolveInfo, *, channel=None, **kwargs):
+        validate_and_apply_search_rank_sorting(
+            kwargs, CheckoutSortField.RANK, "CheckoutSortingInput", info
+        )
         qs = resolve_checkouts(info, channel)
         qs = filter_connection_queryset(
             qs, kwargs, allow_replica=info.context.allow_replica
@@ -120,11 +133,10 @@ class CheckoutMutations(graphene.ObjectType):
     checkout_customer_attach = CheckoutCustomerAttach.Field()
     checkout_customer_detach = CheckoutCustomerDetach.Field()
     checkout_customer_note_update = CheckoutCustomerNoteUpdate.Field()
+    checkout_delete = CheckoutDelete.Field()
     checkout_email_update = CheckoutEmailUpdate.Field()
     checkout_line_delete = CheckoutLineDelete.Field(
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `checkoutLinesDelete` instead."
-        )
+        deprecation_reason="Use `checkoutLinesDelete` instead."
     )
     checkout_lines_delete = CheckoutLinesDelete.Field()
     checkout_lines_add = CheckoutLinesAdd.Field()
@@ -133,9 +145,7 @@ class CheckoutMutations(graphene.ObjectType):
     checkout_payment_create = CheckoutPaymentCreate.Field()
     checkout_shipping_address_update = CheckoutShippingAddressUpdate.Field()
     checkout_shipping_method_update = CheckoutShippingMethodUpdate.Field(
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `checkoutDeliveryMethodUpdate` instead."
-        )
+        deprecation_reason="Use `checkoutDeliveryMethodUpdate` instead."
     )
     checkout_delivery_method_update = CheckoutDeliveryMethodUpdate.Field()
     checkout_language_code_update = CheckoutLanguageCodeUpdate.Field()

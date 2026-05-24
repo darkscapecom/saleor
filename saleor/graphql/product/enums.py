@@ -1,12 +1,18 @@
+from typing import Final
+
+import graphene
+
 from ...product import ProductMediaTypes, ProductTypeKind
 from ..core.doc_category import DOC_CATEGORY_PRODUCTS
 from ..core.enums import to_enum
 from ..core.types import BaseEnum
 
-ProductTypeKindEnum = to_enum(ProductTypeKind)
+ProductTypeKindEnum: Final[graphene.Enum] = to_enum(ProductTypeKind)
 ProductTypeKindEnum.doc_category = DOC_CATEGORY_PRODUCTS
 
-ProductMediaType = to_enum(ProductMediaTypes, type_name="ProductMediaType")
+ProductMediaType: Final[graphene.Enum] = to_enum(
+    ProductMediaTypes, type_name="ProductMediaType"
+)
 ProductMediaType.doc_category = DOC_CATEGORY_PRODUCTS
 
 
@@ -48,6 +54,18 @@ class ProductTypeEnum(BaseEnum):
 
     class Meta:
         doc_category = DOC_CATEGORY_PRODUCTS
+
+    @property
+    def deprecation_reason(self):
+        deprecations = {
+            ProductTypeEnum.DIGITAL.name: (  # type: ignore[attr-defined] # graphene.Enum is not typed # noqa: E501
+                "DIGITAL will removed in Saleor 3.24.0, use metadata or "
+                "attributes instead."
+            )
+        }
+        if self.name in deprecations:
+            return deprecations[self.name]
+        return None
 
 
 class VariantAttributeScope(BaseEnum):

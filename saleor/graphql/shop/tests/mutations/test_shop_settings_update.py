@@ -1,18 +1,17 @@
-from unittest.mock import ANY
+from unittest.mock import ANY, patch
 
 import pytest
 
 from .....core.error_codes import ShopErrorCode
+from .....core.jwt import JWT_OWNER_FIELD
 from .....site.models import Site
 from ....tests.utils import get_graphql_content
+from ...enums import PasswordLoginModeEnum
 
 SHOP_SETTINGS_UPDATE_MUTATION = """
     mutation updateSettings($input: ShopSettingsInput!) {
         shopSettingsUpdate(input: $input) {
             shop {
-                automaticFulfillmentDigitalProducts
-                defaultDigitalMaxDownloads
-                defaultDigitalUrlValidDays
                 headerText,
                 includeTaxesInPrices,
                 chargeTaxesOnShipping,
@@ -23,6 +22,9 @@ SHOP_SETTINGS_UPDATE_MUTATION = """
                 reserveStockDurationAuthenticatedUser
                 limitQuantityPerCheckout
                 allowLoginWithoutConfirmation
+                useLegacyUpdateWebhookEmission
+                preserveAllAddressFields
+                useLegacyShippingZoneStockAvailability
             }
             errors {
                 field
@@ -32,41 +34,6 @@ SHOP_SETTINGS_UPDATE_MUTATION = """
         }
     }
 """
-
-
-def test_shop_digital_content_settings_mutation(
-    staff_api_client, site_settings, permission_manage_settings
-):
-    # given
-    query = SHOP_SETTINGS_UPDATE_MUTATION
-
-    max_downloads = 15
-    url_valid_days = 30
-    variables = {
-        "input": {
-            "automaticFulfillmentDigitalProducts": True,
-            "defaultDigitalMaxDownloads": max_downloads,
-            "defaultDigitalUrlValidDays": url_valid_days,
-        }
-    }
-
-    assert not site_settings.automatic_fulfillment_digital_products
-
-    # when
-    response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_settings]
-    )
-    content = get_graphql_content(response)
-
-    # then
-    data = content["data"]["shopSettingsUpdate"]["shop"]
-    assert data["automaticFulfillmentDigitalProducts"]
-    assert data["defaultDigitalMaxDownloads"]
-    assert data["defaultDigitalUrlValidDays"]
-    site_settings.refresh_from_db()
-    assert site_settings.automatic_fulfillment_digital_products
-    assert site_settings.default_digital_max_downloads == max_downloads
-    assert site_settings.default_digital_url_valid_days == url_valid_days
 
 
 def test_shop_settings_mutation(
@@ -85,6 +52,7 @@ def test_shop_settings_mutation(
             "fulfillmentAllowUnpaid": False,
             "enableAccountConfirmationByEmail": False,
             "allowLoginWithoutConfirmation": True,
+            "useLegacyUpdateWebhookEmission": False,
         }
     }
 
@@ -103,12 +71,16 @@ def test_shop_settings_mutation(
     assert data["fulfillmentAllowUnpaid"] is False
     assert data["enableAccountConfirmationByEmail"] is False
     assert data["allowLoginWithoutConfirmation"] is True
+    assert data["useLegacyUpdateWebhookEmission"] is False
 
     site_settings.refresh_from_db()
     assert not site_settings.include_taxes_in_prices
     assert site_settings.charge_taxes_on_shipping == new_charge_taxes_on_shipping
     assert site_settings.enable_account_confirmation_by_email is False
     assert site_settings.allow_login_without_confirmation is True
+    assert site_settings.use_legacy_update_webhook_emission is False
+    assert site_settings.preserve_all_address_fields is False
+    assert site_settings.use_legacy_shipping_zone_stock_availability is True
 
 
 def test_shop_reservation_settings_mutation(
@@ -269,9 +241,9 @@ def test_shop_customer_set_password_url_update(
 @pytest.mark.parametrize(
     "customer_set_password_url",
     [
-        ("http://not-allowed-storefron.com/pass"),
-        ("http://[value-error-in-urlparse@test/pass"),
-        ("without-protocole.com/pass"),
+        "http://not-allowed-storefron.com/pass",
+        "http://[value-error-in-urlparse@test/pass",
+        "without-protocole.com/pass",
     ],
 )
 def test_shop_customer_set_password_url_update_invalid_url(
@@ -301,6 +273,158 @@ def test_shop_customer_set_password_url_update_invalid_url(
     }
     site_settings.refresh_from_db()
     assert not site_settings.customer_set_password_url
+
+
+MUTATION_UPDATE_PRESERVE_ALL_ADDRESS_FIELDS = """
+    mutation updateSettings($input: ShopSettingsInput!) {
+        shopSettingsUpdate(input: $input) {
+            shop {
+                preserveAllAddressFields
+            }
+            errors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+def test_shop_settings_update_preserve_all_address_fields_enable(
+    staff_api_client, site_settings, permission_manage_settings
+):
+    # given
+    assert site_settings.preserve_all_address_fields is False
+    variables = {"input": {"preserveAllAddressFields": True}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_PRESERVE_ALL_ADDRESS_FIELDS,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert data["shop"]["preserveAllAddressFields"] is True
+    site_settings.refresh_from_db()
+    assert site_settings.preserve_all_address_fields is True
+
+
+def test_shop_settings_update_preserve_all_address_fields_disable(
+    staff_api_client, site_settings, permission_manage_settings
+):
+    # given
+    site_settings.preserve_all_address_fields = True
+    site_settings.save(update_fields=["preserve_all_address_fields"])
+    variables = {"input": {"preserveAllAddressFields": False}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_PRESERVE_ALL_ADDRESS_FIELDS,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert data["shop"]["preserveAllAddressFields"] is False
+    site_settings.refresh_from_db()
+    assert site_settings.preserve_all_address_fields is False
+
+
+MUTATION_UPDATE_use_legacy_shipping_zone_stock_availability = """
+    mutation updateSettings($input: ShopSettingsInput!) {
+        shopSettingsUpdate(input: $input) {
+            shop {
+                useLegacyShippingZoneStockAvailability
+            }
+            errors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+def test_shop_settings_update_use_legacy_shipping_zone_stock_availability_disable(
+    staff_api_client, site_settings, permission_manage_settings
+):
+    # given
+    use_legacy_shipping_zone_stock_availability_value = False
+    assert (
+        site_settings.use_legacy_shipping_zone_stock_availability
+        is not use_legacy_shipping_zone_stock_availability_value
+    )
+    variables = {
+        "input": {
+            "useLegacyShippingZoneStockAvailability": use_legacy_shipping_zone_stock_availability_value
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_use_legacy_shipping_zone_stock_availability,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert (
+        data["shop"]["useLegacyShippingZoneStockAvailability"]
+        is use_legacy_shipping_zone_stock_availability_value
+    )
+    site_settings.refresh_from_db()
+    assert (
+        site_settings.use_legacy_shipping_zone_stock_availability
+        == use_legacy_shipping_zone_stock_availability_value
+    )
+
+
+def test_shop_settings_update_use_legacy_shipping_zone_stock_availability_enable(
+    staff_api_client, site_settings, permission_manage_settings
+):
+    # given
+    use_legacy_shipping_zone_stock_availability_value = True
+    site_settings.use_legacy_shipping_zone_stock_availability = False
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
+    variables = {
+        "input": {
+            "useLegacyShippingZoneStockAvailability": use_legacy_shipping_zone_stock_availability_value
+        }
+    }
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_use_legacy_shipping_zone_stock_availability,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert (
+        data["shop"]["useLegacyShippingZoneStockAvailability"]
+        == use_legacy_shipping_zone_stock_availability_value
+    )
+    site_settings.refresh_from_db()
+    assert (
+        site_settings.use_legacy_shipping_zone_stock_availability
+        == use_legacy_shipping_zone_stock_availability_value
+    )
 
 
 MUTATION_UPDATE_DEFAULT_MAIL_SENDER_SETTINGS = """
@@ -407,3 +531,106 @@ def test_update_default_sender_settings_invalid_email(
     assert errors == [
         {"field": "defaultMailSenderAddress", "message": "Enter a valid email address."}
     ]
+
+
+MUTATION_UPDATE_PASSWORD_LOGIN_MODE = """
+    mutation updateSettings($input: ShopSettingsInput!) {
+        shopSettingsUpdate(input: $input) {
+            shop {
+                passwordLoginMode
+            }
+            errors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [PasswordLoginModeEnum.DISABLED.name, PasswordLoginModeEnum.CUSTOMERS_ONLY.name],
+)
+def test_shop_settings_update_password_login_mode_blocked_for_password_auth(
+    staff_api_client, site_settings, permission_manage_settings, mode
+):
+    # given
+    variables = {"input": {"passwordLoginMode": mode}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_PASSWORD_LOGIN_MODE,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert len(data["errors"]) == 1
+    error = data["errors"][0]
+    assert error["field"] == "passwordLoginMode"
+    assert error["code"] == ShopErrorCode.PASSWORD_AUTH_RESTRICTION.name
+    site_settings.refresh_from_db()
+    assert site_settings.password_login_mode == PasswordLoginModeEnum.ENABLED.value
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        PasswordLoginModeEnum.ENABLED.name,
+        PasswordLoginModeEnum.DISABLED.name,
+        PasswordLoginModeEnum.CUSTOMERS_ONLY.name,
+    ],
+)
+def test_shop_settings_update_password_login_mode_allowed_for_oidc_auth(
+    staff_api_client, site_settings, permission_manage_settings, mode
+):
+    # given
+    oidc_owner = "mirumee.authentication.openidconnect"
+    oidc_token_payload = {JWT_OWNER_FIELD: oidc_owner}
+    variables = {"input": {"passwordLoginMode": mode}}
+
+    # when
+    with patch(
+        "saleor.graphql.context.jwt_decode_with_exception_handler",
+        return_value=oidc_token_payload,
+    ):
+        response = staff_api_client.post_graphql(
+            MUTATION_UPDATE_PASSWORD_LOGIN_MODE,
+            variables,
+            permissions=[permission_manage_settings],
+        )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert data["shop"]["passwordLoginMode"] == mode
+
+
+def test_shop_settings_update_password_login_mode_preserves_when_not_provided(
+    staff_api_client, site_settings, permission_manage_settings
+):
+    # given
+    login_mode = PasswordLoginModeEnum.ENABLED.value
+    site_settings.password_login_mode = login_mode
+    site_settings.save(update_fields=["password_login_mode"])
+    variables = {"input": {"headerText": "New header"}}
+
+    # when
+    response = staff_api_client.post_graphql(
+        MUTATION_UPDATE_PASSWORD_LOGIN_MODE,
+        variables,
+        permissions=[permission_manage_settings],
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["shopSettingsUpdate"]
+    assert not data["errors"]
+    assert data["shop"]["passwordLoginMode"] == login_mode.upper()
+    site_settings.refresh_from_db()
+    assert site_settings.password_login_mode == login_mode

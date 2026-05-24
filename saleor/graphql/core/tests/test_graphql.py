@@ -1,6 +1,6 @@
 from functools import partial
 from unittest import mock
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import graphene
 import pytest
@@ -27,7 +27,12 @@ def test_middleware_dont_generate_sql_requests(client, settings, assert_num_quer
         assert response.status_code == 200
 
 
-def test_jwt_middleware(client, admin_user):
+@patch("saleor.account.throttling.cache")
+def test_jwt_middleware(mocked_cache, client, admin_user, setup_mock_for_cache):
+    setup_mock_for_cache({}, mocked_cache)
+
+    # We should't base on `wsgi_request` attribute to check if user is authenticated.
+    # Saleor is ASGI app, also request could be changed after response is returned.
     user_details_query = """
         {
           me {
@@ -51,14 +56,12 @@ def test_jwt_middleware(client, admin_user):
     response = api_client_post(data={"query": user_details_query})
     repl_data = response.json()
     assert response.status_code == 200
-    assert not response.wsgi_request.user
     assert repl_data["data"]["me"] is None
 
     # test creating a token for admin user
     response = api_client_post(data={"query": create_token_query})
     repl_data = response.json()
     assert response.status_code == 200
-    assert response.wsgi_request.user == admin_user
     token = repl_data["data"]["tokenCreate"]["token"]
     assert token is not None
 
@@ -68,7 +71,6 @@ def test_jwt_middleware(client, admin_user):
     )
     repl_data = response.json()
     assert response.status_code == 200
-    assert response.wsgi_request.user == admin_user
     assert "errors" not in repl_data
     assert repl_data["data"]["me"] == {"email": admin_user.email}
 

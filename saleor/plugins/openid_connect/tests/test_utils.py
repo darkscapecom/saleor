@@ -14,6 +14,7 @@ from requests import Response
 from requests_hardened import HTTPSession
 
 from ....account.models import Group, User
+from ....account.search import update_user_search_vector
 from ....core.jwt import (
     JWT_REFRESH_TYPE,
     PERMISSIONS_FIELD,
@@ -63,7 +64,7 @@ def test_fetch_jwks_raises_error(monkeypatch, error):
         fetch_jwks(jwks_url)
 
 
-@pytest.mark.vcr
+@pytest.mark.vcr(decode_compressed_response=True)
 @mock.patch("saleor.plugins.openid_connect.utils.cache.set")
 def test_fetch_jwks(mocked_cache_set):
     jwks_url = "https://saleor.io/.well-known/jwks.json"
@@ -297,6 +298,66 @@ def test_get_or_create_user_from_payload_assigns_sub(
     assert user_from_payload.id == customer_user.id
     assert user_from_payload.private_metadata[f"oidc:{oauth_url}"] == sub_id
     assert customer_user.is_staff is False
+    assert not user_from_payload.has_usable_password()
+
+
+@mock.patch("saleor.plugins.openid_connect.utils.cache.set")
+@mock.patch("saleor.plugins.openid_connect.utils.cache.get")
+def test_get_or_create_user_from_payload_clears_password_for_existing_user(
+    mocked_cache_get, mocked_cache_set, customer_user
+):
+    # When OIDC finds an existing user by email (not by sub), the old password
+    # should be invalidated to prevent login with stale credentials.
+
+    # given
+    oauth_url = "https://saleor.io/oauth"
+    sub_id = "oauth|new-sub"
+    assert customer_user.has_usable_password()
+
+    mocked_cache_get.side_effect = lambda cache_key: None
+
+    # when
+    user_from_payload, created, _ = get_or_create_user_from_payload(
+        payload={"sub": sub_id, "email": customer_user.email},
+        oauth_url=oauth_url,
+    )
+
+    # then
+    assert not created
+    assert user_from_payload.id == customer_user.id
+    assert not user_from_payload.has_usable_password()
+    customer_user.refresh_from_db()
+    assert not customer_user.has_usable_password()
+
+
+@mock.patch("saleor.plugins.openid_connect.utils.cache.set")
+@mock.patch("saleor.plugins.openid_connect.utils.cache.get")
+def test_get_or_create_user_from_payload_keeps_password_for_returning_oidc_user(
+    mocked_cache_get, mocked_cache_set, customer_user
+):
+    # When an existing OIDC user is found by email (cache miss on sub lookup),
+    # the password should NOT be cleared since they already have the OIDC identity.
+
+    # given
+    oauth_url = "https://saleor.io/oauth"
+    sub_id = "oauth|existing-sub"
+    oidc_key = f"oidc:{oauth_url}"
+    customer_user.store_value_in_private_metadata({oidc_key: sub_id})
+    customer_user.save(update_fields=["private_metadata"])
+    assert customer_user.has_usable_password()
+
+    mocked_cache_get.side_effect = lambda cache_key: None
+
+    # when
+    user_from_payload, created, _ = get_or_create_user_from_payload(
+        payload={"sub": sub_id, "email": customer_user.email},
+        oauth_url=oauth_url,
+    )
+
+    # then
+    assert not created
+    assert user_from_payload.id == customer_user.id
+    assert user_from_payload.has_usable_password()
 
 
 @mock.patch("saleor.plugins.openid_connect.utils.cache.set")
@@ -1014,13 +1075,16 @@ def test_update_user_details_user_with_new_email_in_db(
     mock_match_orders_with_new_user.assert_not_called()
 
 
+@patch(
+    "saleor.plugins.openid_connect.utils.update_user_search_vector",
+    wraps=update_user_search_vector,
+)
 def test_update_user_details_update_user_first_name(
+    update_user_search_vector_mock,
     customer_user,
 ):
     # given
-    expected_search_document = "test@example.com\ntest user_first_name\nwade\n"
     assert customer_user.first_name != "test user_first_name"
-    assert customer_user.search_document != expected_search_document
 
     # when
     updated = _update_user_details(
@@ -1036,17 +1100,21 @@ def test_update_user_details_update_user_first_name(
     # then
     customer_user.refresh_from_db()
     assert customer_user.first_name == "test user_first_name"
-    assert customer_user.search_document == expected_search_document
+    assert customer_user.search_vector
     assert updated is True
+    update_user_search_vector_mock.assert_called_once()
 
 
+@patch(
+    "saleor.plugins.openid_connect.utils.update_user_search_vector",
+    wraps=update_user_search_vector,
+)
 def test_update_user_details_update_user_last_name(
+    update_user_search_vector_mock,
     customer_user,
 ):
     # given
-    expected_search_document = "test@example.com\nleslie\ntest user_last_name\n"
     assert customer_user.last_name != "test user_last_name"
-    assert customer_user.search_document != expected_search_document
 
     # when
     updated = _update_user_details(
@@ -1062,18 +1130,24 @@ def test_update_user_details_update_user_last_name(
     # then
     customer_user.refresh_from_db()
     assert customer_user.last_name == "test user_last_name"
-    assert customer_user.search_document == expected_search_document
+    assert customer_user.search_vector
     assert updated is True
+    update_user_search_vector_mock.assert_called_once()
 
 
+@patch(
+    "saleor.plugins.openid_connect.utils.update_user_search_vector",
+    wraps=update_user_search_vector,
+)
 def test_update_user_details_nothing_changed(
+    update_user_search_vector_mock,
     customer_user,
 ):
     # given
     last_login = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(minutes=14)
     customer_user.last_login = last_login
-    customer_user.search_document = "abc"
-    customer_user.save(update_fields=["search_document", "last_login"])
+    update_user_search_vector(customer_user, save=False)
+    customer_user.save(update_fields=["search_vector", "last_login"])
 
     first_name = customer_user.first_name
 
@@ -1092,3 +1166,4 @@ def test_update_user_details_nothing_changed(
     customer_user.refresh_from_db()
     assert customer_user.first_name == first_name
     assert updated is False
+    update_user_search_vector_mock.assert_not_called()

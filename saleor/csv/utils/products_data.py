@@ -11,8 +11,8 @@ from django.db.models.functions import Cast, Concat
 
 from ...attribute import AttributeInputType
 from ...attribute.models import AssignedVariantAttribute, Attribute, AttributeValue
+from ...core.editorjs import editorjs_to_text
 from ...core.utils import build_absolute_uri
-from ...core.utils.editorjs import clean_editor_js
 from ...product.models import (
     ProductChannelListing,
     ProductVariant,
@@ -145,7 +145,7 @@ def prepare_products_relations_data(
 
     relations_data = queryset.values(*fields)
 
-    for data in relations_data.iterator():
+    for data in relations_data.iterator(chunk_size=1000):
         pk = data.get("pk")
         collection = data.get("collections__slug")
         image = data.pop("media__image", None)
@@ -184,7 +184,7 @@ def prepare_products_relations_data(
         )
         fields_for_attrs.update(attribute_fields.values())
         relations_data = relations_data.values(*fields_for_attrs)
-        for data in relations_data.iterator():
+        for data in relations_data.iterator(chunk_size=1000):
             pk = data.get("pk")
             result_data, data = handle_attribute_data(
                 pk,
@@ -251,7 +251,7 @@ def prepare_variants_relations_data(
 
     relations_data = queryset.values(*fields)
 
-    for data in relations_data.iterator():
+    for data in relations_data.iterator(chunk_size=1000):
         pk = data.get("variants__pk")
         image = data.pop("variants__media__image", None)
 
@@ -369,6 +369,8 @@ class AttributeData:
     reference_page: str | None = None
     reference_product: str | None = None
     reference_variant: str | None = None
+    reference_category: str | None = None
+    reference_collection: str | None = None
 
 
 def handle_attribute_data(
@@ -479,9 +481,7 @@ def prepare_attribute_value(attribute_data: AttributeData):
                 else f"{data.value_name} {data.unit}"
             )
         ),
-        AttributeInputType.RICH_TEXT: (
-            lambda data: clean_editor_js(data.rich_text, to_string=True)
-        ),
+        AttributeInputType.RICH_TEXT: lambda data: editorjs_to_text(data.rich_text),
         AttributeInputType.BOOLEAN: (
             lambda data: str(data.boolean) if data.boolean is not None else None
         ),
@@ -514,15 +514,23 @@ def _get_reference_value(attribute_data):
             attribute_data.reference_page,
             attribute_data.reference_product,
             attribute_data.reference_variant,
+            attribute_data.reference_category,
+            attribute_data.reference_collection,
         ]
     ):
         return None
+
     if attribute_data.reference_page:
         reference_id = attribute_data.reference_page
     elif attribute_data.reference_product:
         reference_id = attribute_data.reference_product
-    else:
+    elif attribute_data.reference_variant:
         reference_id = attribute_data.reference_variant
+    elif attribute_data.reference_category:
+        reference_id = attribute_data.reference_category
+    else:
+        reference_id = attribute_data.reference_collection
+
     return f"{attribute_data.entity_type}_{reference_id}"
 
 

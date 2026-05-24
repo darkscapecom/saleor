@@ -191,7 +191,7 @@ def test_update_public_metadata_for_item_on_deleted_instance(api_client, checkou
 
     # when
     with race_condition.RunBefore(
-        "saleor.graphql.meta.mutations.update_metadata.save_instance",
+        "saleor.graphql.meta.mutations.update_metadata.update_metadata",
         delete_checkout_object,
     ):
         response = execute_update_public_metadata_for_item(
@@ -248,3 +248,84 @@ def test_update_public_metadata_for_item_without_meta(
     errors = response["data"]["updateMetadata"]["errors"]
     assert errors[0]["field"] == "id"
     assert errors[0]["code"] == MetadataErrorCode.NOT_FOUND.name
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_public_metadata_key_updated_in_meantime(api_client, checkout):
+    # given
+    checkout.metadata_storage.store_value_in_metadata({PUBLIC_KEY: PUBLIC_VALUE})
+    checkout.metadata_storage.save(update_fields=["metadata"])
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+
+    def update_metadata(*args, **kwargs):
+        checkout.metadata_storage.store_value_in_metadata({"new_before": "value"})
+        checkout.metadata_storage.save(update_fields=["metadata"])
+
+    # when
+    with race_condition.RunBefore(
+        "saleor.graphql.meta.mutations.update_metadata.update_metadata",
+        update_metadata,
+    ):
+        # update without using postgresql `concat` operation to
+        # test concurrent safe update in `updateMetadata`
+        response = execute_update_public_metadata_for_item(
+            api_client,
+            None,
+            checkout.token,
+            "Checkout",
+            value="NewMetaValue",
+            ignore_errors=True,
+        )
+
+    # then
+    assert not response["data"]["updateMetadata"]["errors"]
+    assert item_contains_multiple_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        checkout.metadata_storage,
+        checkout_id,
+        value="NewMetaValue",
+        key2="new_before",
+        value2="value",
+    )
+
+
+def test_update_public_metadata_another_key_deleted_in_meantime(
+    staff_api_client, order, permission_manage_orders
+):
+    # given
+    key_to_delete = "to_delete"
+    order.store_value_in_metadata(
+        {PUBLIC_KEY: PUBLIC_VALUE, key_to_delete: PUBLIC_VALUE}
+    )
+    order.save(update_fields=["metadata"])
+    order_id = graphene.Node.to_global_id("Order", order.pk)
+
+    new_value = "updated_value"
+
+    def delete_public_metadata(*args, **kwargs):
+        order.delete_value_from_metadata(key_to_delete)
+        order.save(update_fields=["metadata"])
+
+    # when
+    with race_condition.RunBefore(
+        "saleor.graphql.meta.mutations.update_metadata.update_metadata",
+        delete_public_metadata,
+    ):
+        response = execute_update_public_metadata_for_item(
+            staff_api_client,
+            permission_manage_orders,
+            order.id,
+            "Order",
+            value=new_value,
+        )
+
+    # then
+    order.refresh_from_db()
+    assert item_contains_proper_public_metadata(
+        response["data"]["updateMetadata"]["item"],
+        order,
+        order_id,
+        key=PUBLIC_KEY,
+        value=new_value,
+    )
+    assert order.get_value_from_metadata(key_to_delete) is None

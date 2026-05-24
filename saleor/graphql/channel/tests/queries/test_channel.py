@@ -311,6 +311,8 @@ QUERY_CHANNEL_ORDER_SETTINGS = """
                 deleteExpiredOrdersAfter
                 allowUnpaidOrders
                 includeDraftOrderInVoucherUsage
+                draftOrderLinePriceFreezePeriod
+                useLegacyLineDiscountPropagation
             }
         }
     }
@@ -367,6 +369,15 @@ def test_query_channel_order_settings_as_staff_user(
         channel_data["orderSettings"]["includeDraftOrderInVoucherUsage"]
         == channel_USD.include_draft_order_in_voucher_usage
     )
+    assert (
+        channel_data["orderSettings"]["draftOrderLinePriceFreezePeriod"]
+        == channel_USD.draft_order_line_price_freeze_period
+    )
+
+    assert (
+        channel_data["orderSettings"]["useLegacyLineDiscountPropagation"]
+        == channel_USD.use_legacy_line_discount_propagation_for_order
+    )
 
 
 def test_query_channel_order_settings_as_app(
@@ -413,6 +424,14 @@ def test_query_channel_order_settings_as_app(
         channel_data["orderSettings"]["includeDraftOrderInVoucherUsage"]
         == channel_USD.include_draft_order_in_voucher_usage
     )
+    assert (
+        channel_data["orderSettings"]["draftOrderLinePriceFreezePeriod"]
+        == channel_USD.draft_order_line_price_freeze_period
+    )
+    assert (
+        channel_data["orderSettings"]["useLegacyLineDiscountPropagation"]
+        == channel_USD.use_legacy_line_discount_propagation_for_order
+    )
 
 
 def test_query_channel_order_settings_as_staff_user_no_permission(
@@ -457,6 +476,7 @@ QUERY_CHANNEL_CHECKOUT_SETTINGS = """
             checkoutSettings {
                 useLegacyErrorFlow
                 automaticallyCompleteFullyPaidCheckouts
+                allowLegacyGiftCardUse
             }
         }
     }
@@ -469,10 +489,12 @@ def test_query_channel_checkout_settings_as_staff_user(
     # given
     channel_USD.use_legacy_error_flow_for_checkout = False
     channel_USD.automatically_complete_fully_paid_checkouts = True
+    channel_USD.allow_legacy_gift_card_use = False
     channel_USD.save(
         update_fields=[
             "use_legacy_error_flow_for_checkout",
             "automatically_complete_fully_paid_checkouts",
+            "allow_legacy_gift_card_use",
         ]
     )
 
@@ -497,6 +519,10 @@ def test_query_channel_checkout_settings_as_staff_user(
     assert (
         channel_data["checkoutSettings"]["automaticallyCompleteFullyPaidCheckouts"]
         == channel_USD.automatically_complete_fully_paid_checkouts
+    )
+    assert (
+        channel_data["checkoutSettings"]["allowLegacyGiftCardUse"]
+        == channel_USD.allow_legacy_gift_card_use
     )
 
 

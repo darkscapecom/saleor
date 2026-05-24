@@ -16,30 +16,25 @@ from ....product.utils.costs import (
 from ....tax.utils import (
     get_display_gross_prices,
     get_tax_calculation_strategy,
-    get_tax_rate_for_tax_class,
+    get_tax_rate_for_country,
 )
 from ...account import types as account_types
-from ...channel.dataloaders import ChannelByIdLoader
+from ...channel.dataloaders.by_self import ChannelByIdLoader
 from ...channel.types import Channel
-from ...core.descriptions import ADDED_IN_321, DEPRECATED_IN_3X_FIELD
+from ...core.descriptions import ADDED_IN_321
 from ...core.doc_category import DOC_CATEGORY_PRODUCTS
 from ...core.fields import PermissionsField
 from ...core.scalars import Date, DateTime
 from ...core.tracing import traced_resolver
 from ...core.types import BaseObjectType, ModelObjectType
 from ...tax.dataloaders import (
-    TaxClassByProductIdLoader,
     TaxClassCountryRateByTaxClassIDLoader,
     TaxClassDefaultRateByCountryLoader,
+    TaxClassIdByProductIdLoader,
     TaxConfigurationByChannelId,
     TaxConfigurationPerCountryByTaxConfigurationIDLoader,
 )
-from ..dataloaders import (
-    ProductByIdLoader,
-    ProductVariantsByProductIdLoader,
-    VariantChannelListingByVariantIdAndChannelSlugLoader,
-    VariantsChannelListingByProductIdAndChannelSlugLoader,
-)
+from ..dataloaders.products import VariantChannelListingsByProductIdLoader
 
 
 class Margin(BaseObjectType):
@@ -56,10 +51,7 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
         required=True, description="The ID of the product channel listing."
     )
     publication_date = Date(
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} "
-            "Use the `publishedAt` field to fetch the publication date."
-        ),
+        deprecation_reason="Use the `publishedAt` field to fetch the publication date.",
     )
     published_at = DateTime(description="The product publication date time.")
     is_published = graphene.Boolean(
@@ -76,11 +68,7 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
         description="Indicates product visibility in the channel listings.",
     )
     available_for_purchase = Date(
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} "
-            "Use the `availableForPurchaseAt` field to fetch "
-            "the available for purchase date."
-        ),
+        deprecation_reason="Use the `availableForPurchaseAt` field to fetch the available for purchase date.",
     )
     available_for_purchase_at = DateTime(
         description="The product available for purchase date time."
@@ -143,79 +131,55 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
     @staticmethod
     @traced_resolver
     def resolve_purchase_cost(root: models.ProductChannelListing, info):
-        channel = ChannelByIdLoader(info.context).load(root.channel_id)
+        def calculate_margin_with_channel_listings(
+            variant_channel_listings: list[models.ProductVariantChannelListing | None],
+        ):
+            existing_listings: list[models.ProductVariantChannelListing] = []
+            for listing in variant_channel_listings:
+                if not listing:
+                    continue
+                if listing.channel_id == root.channel_id:
+                    existing_listings.append(listing)
 
-        def calculate_margin_with_variants(variants):
-            def calculate_margin_with_channel(channel):
-                def calculate_margin_with_channel_listings(
-                    variant_channel_listings: list[
-                        models.ProductVariantChannelListing | None
-                    ],
-                ):
-                    existing_listings = list(filter(None, variant_channel_listings))
-                    if not existing_listings:
-                        return None
+            if not existing_listings:
+                return None
 
-                    has_variants = True if len(variant_ids_channel_slug) > 0 else False
-                    purchase_cost, _margin = get_product_costs_data(
-                        existing_listings, has_variants, root.currency
-                    )
-                    return purchase_cost
-
-                variant_ids_channel_slug = [
-                    (variant.id, channel.slug) for variant in variants
-                ]
-                return (
-                    VariantChannelListingByVariantIdAndChannelSlugLoader(info.context)
-                    .load_many(variant_ids_channel_slug)
-                    .then(calculate_margin_with_channel_listings)
-                )
-
-            return channel.then(calculate_margin_with_channel)
+            purchase_cost, _margin = get_product_costs_data(
+                existing_listings, root.currency
+            )
+            return purchase_cost
 
         return (
-            ProductVariantsByProductIdLoader(info.context)
+            VariantChannelListingsByProductIdLoader(info.context)
             .load(root.product_id)
-            .then(calculate_margin_with_variants)
+            .then(calculate_margin_with_channel_listings)
         )
 
     @staticmethod
     @traced_resolver
     def resolve_margin(root: models.ProductChannelListing, info):
-        channel = ChannelByIdLoader(info.context).load(root.channel_id)
+        def calculate_margin_with_channel_listings(
+            variant_channel_listings: list[models.ProductVariantChannelListing | None],
+        ):
+            existing_listings: list[models.ProductVariantChannelListing] = []
+            for listing in variant_channel_listings:
+                if not listing:
+                    continue
+                if listing.channel_id == root.channel_id:
+                    existing_listings.append(listing)
 
-        def calculate_margin_with_variants(variants):
-            def calculate_margin_with_channel(channel):
-                def calculate_margin_with_channel_listings(
-                    variant_channel_listings: list[
-                        models.ProductVariantChannelListing | None
-                    ],
-                ):
-                    existing_listings = list(filter(None, variant_channel_listings))
-                    if not existing_listings:
-                        return None
+            if not existing_listings:
+                return None
 
-                    has_variants = True if len(variant_ids_channel_slug) > 0 else False
-                    _purchase_cost, margin = get_product_costs_data(
-                        existing_listings, has_variants, root.currency
-                    )
-                    return Margin(margin[0], margin[1])
-
-                variant_ids_channel_slug = [
-                    (variant.id, channel.slug) for variant in variants
-                ]
-                return (
-                    VariantChannelListingByVariantIdAndChannelSlugLoader(info.context)
-                    .load_many(variant_ids_channel_slug)
-                    .then(calculate_margin_with_channel_listings)
-                )
-
-            return channel.then(calculate_margin_with_channel)
+            _purchase_cost, margin = get_product_costs_data(
+                existing_listings, root.currency
+            )
+            return Margin(margin[0], margin[1])
 
         return (
-            ProductVariantsByProductIdLoader(info.context)
+            VariantChannelListingsByProductIdLoader(info.context)
             .load(root.product_id)
-            .then(calculate_margin_with_variants)
+            .then(calculate_margin_with_channel_listings)
         )
 
     @staticmethod
@@ -227,24 +191,26 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
         context = info.context
 
         channel = ChannelByIdLoader(context).load(root.channel_id)
-        product = ProductByIdLoader(context).load(root.product_id)
+        tax_class_id_loader = TaxClassIdByProductIdLoader(context).load(root.product_id)
 
         def load_tax_configuration(data):
-            channel, product = data
+            channel, tax_class_id = data
             country_code = get_active_country(channel, address_data=address)
 
             def load_tax_country_exceptions(tax_config):
-                tax_class = TaxClassByProductIdLoader(info.context).load(product.id)
-                tax_configs_per_country = (
-                    TaxConfigurationPerCountryByTaxConfigurationIDLoader(context).load(
-                        tax_config.id
-                    )
-                )
-
                 def load_variant_channel_listings(data):
-                    tax_class, tax_configs_per_country = data
+                    tax_configs_per_country = data
 
-                    def load_default_tax_rate(variants_channel_listing):
+                    def load_default_tax_rate(
+                        variants_channel_listings: list[
+                            models.ProductVariantChannelListing
+                        ],
+                    ):
+                        variants_channel_listing = []
+                        for listing in variants_channel_listings:
+                            if listing and listing.channel_id == channel.id:
+                                variants_channel_listing.append(listing)
+
                         if not variants_channel_listing:
                             return None
 
@@ -271,8 +237,8 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
                                 if default_country_rate_obj
                                 else Decimal(0)
                             )
-                            tax_rate = get_tax_rate_for_tax_class(
-                                tax_class, country_rates, default_tax_rate, country_code
+                            tax_rate = get_tax_rate_for_country(
+                                country_rates, default_tax_rate, country_code
                             )
                             prices_entered_with_tax = tax_config.prices_entered_with_tax
 
@@ -291,10 +257,10 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
 
                         country_rates = (
                             TaxClassCountryRateByTaxClassIDLoader(context).load(
-                                tax_class.pk
+                                tax_class_id
                             )
-                            if tax_class
-                            else []
+                            if tax_class_id
+                            else Promise.resolve([])
                         )
                         default_country_rate = TaxClassDefaultRateByCountryLoader(
                             context
@@ -304,14 +270,16 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
                         )
 
                     return (
-                        VariantsChannelListingByProductIdAndChannelSlugLoader(context)
-                        .load((root.product_id, channel.slug))
+                        VariantChannelListingsByProductIdLoader(context)
+                        .load(root.product_id)
                         .then(load_default_tax_rate)
                     )
 
-                return Promise.all([tax_class, tax_configs_per_country]).then(
-                    load_variant_channel_listings
-                )
+                return (
+                    TaxConfigurationPerCountryByTaxConfigurationIDLoader(context).load(
+                        tax_config.id
+                    )
+                ).then(load_variant_channel_listings)
 
             return (
                 TaxConfigurationByChannelId(context)
@@ -319,7 +287,7 @@ class ProductChannelListing(ModelObjectType[models.ProductChannelListing]):
                 .then(load_tax_country_exceptions)
             )
 
-        return Promise.all([channel, product]).then(load_tax_configuration)
+        return Promise.all([channel, tax_class_id_loader]).then(load_tax_configuration)
 
 
 class PreorderThreshold(BaseObjectType):
@@ -352,7 +320,9 @@ class ProductVariantChannelListing(
     cost_price = graphene.Field(Money, description="Cost price of the variant.")
     prior_price = graphene.Field(
         Money,
-        description="Prior price of the variant used for discount calculations."
+        description="Previous price of the variant in channel. Useful for providing "
+        "promotion information required by customer protection laws such as EU Omnibus "
+        "directive.\n\n Warning: This field is not updated automatically. Use Channel Listings mutation to update it manually."
         + ADDED_IN_321,
     )
     margin = PermissionsField(
@@ -394,10 +364,7 @@ class CollectionChannelListing(ModelObjectType[models.CollectionChannelListing])
         required=True, description="The ID of the collection channel listing."
     )
     publication_date = Date(
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} "
-            "Use the `publishedAt` field to fetch the publication date."
-        ),
+        deprecation_reason="Use the `publishedAt` field to fetch the publication date."
     )
     published_at = DateTime(description="The collection publication date.")
     is_published = graphene.Boolean(

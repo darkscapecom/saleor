@@ -3,13 +3,13 @@ from urllib.parse import urlencode
 
 import graphene
 from django.conf import settings
-from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from .....account import models
 from .....account.error_codes import SendConfirmationEmailErrorCode
 from .....account.notifications import send_account_confirmation
+from .....core.tokens import token_generator
 from .....core.utils.url import prepare_url, validate_storefront_url
 from .....permission.auth_filters import AuthorizationFilters
 from .....webhook.event_types import WebhookEventAsyncType
@@ -33,7 +33,7 @@ class SendConfirmationEmail(BaseMutation):
         )
         channel = graphene.String(
             required=True,
-            description=("Slug of a channel which will be used for notify user."),
+            description="Slug of a channel which will be used for notify user.",
         )
 
     class Meta:
@@ -100,7 +100,7 @@ class SendConfirmationEmail(BaseMutation):
             allow_replica=False,
         ).slug
         manager = get_plugin_manager_promise(info.context).get()
-        token = default_token_generator.make_token(user)
+        token = token_generator.make_token(user)
 
         send_account_confirmation(
             user,

@@ -6,7 +6,8 @@ from django.core.files import File
 from prices import Money, TaxedMoney
 
 from .....core.prices import quantize_price
-from .....order import OrderStatus
+from .....discount import DiscountType, DiscountValueType
+from .....order import OrderOrigin, OrderStatus
 from .....order.interface import OrderTaxedPricesData
 from .....thumbnail.models import Thumbnail
 from .....warehouse.models import Stock
@@ -407,7 +408,6 @@ def test_order_query_product_image_size_and_format_given_proxy_url_returned(
     permission_group_manage_orders,
     order_line,
     product_with_image,
-    site_settings,
 ):
     # given
     order_line.variant.product = product_with_image
@@ -427,11 +427,10 @@ def test_order_query_product_image_size_and_format_given_proxy_url_returned(
     content = get_graphql_content(response)
     order_data = content["data"]["orders"]["edges"][0]["node"]
     media_id = graphene.Node.to_global_id("ProductMedia", media.pk)
-    domain = site_settings.site.domain
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{domain}/thumbnail/{media_id}/128/{format.lower()}/"
+        == f"https://example.com/thumbnail/{media_id}/128/{format.lower()}/"
     )
 
 
@@ -440,7 +439,6 @@ def test_order_query_product_image_size_given_proxy_url_returned(
     permission_group_manage_orders,
     order_line,
     product_with_image,
-    site_settings,
 ):
     # given
     order_line.variant.product = product_with_image
@@ -461,7 +459,7 @@ def test_order_query_product_image_size_given_proxy_url_returned(
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{site_settings.site.domain}/thumbnail/{media_id}/128/"
+        == f"https://example.com/thumbnail/{media_id}/128/"
     )
 
 
@@ -470,7 +468,6 @@ def test_order_query_product_image_size_given_thumbnail_url_returned(
     permission_group_manage_orders,
     order_line,
     product_with_image,
-    site_settings,
 ):
     # given
     order_line.variant.product = product_with_image
@@ -495,7 +492,7 @@ def test_order_query_product_image_size_given_thumbnail_url_returned(
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{site_settings.site.domain}/media/thumbnails/{thumbnail_mock.name}"
+        == f"https://example.com/media/thumbnails/{thumbnail_mock.name}"
     )
 
 
@@ -504,7 +501,6 @@ def test_order_query_variant_image_size_and_format_given_proxy_url_returned(
     permission_group_manage_orders,
     order_line,
     variant_with_image,
-    site_settings,
 ):
     # given
     order_line.variant = variant_with_image
@@ -524,11 +520,10 @@ def test_order_query_variant_image_size_and_format_given_proxy_url_returned(
     content = get_graphql_content(response)
     order_data = content["data"]["orders"]["edges"][0]["node"]
     media_id = graphene.Node.to_global_id("ProductMedia", media.pk)
-    domain = site_settings.site.domain
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{domain}/thumbnail/{media_id}/128/{format.lower()}/"
+        == f"https://example.com/thumbnail/{media_id}/128/{format.lower()}/"
     )
 
 
@@ -537,7 +532,6 @@ def test_order_query_variant_image_size_given_proxy_url_returned(
     permission_group_manage_orders,
     order_line,
     variant_with_image,
-    site_settings,
 ):
     # given
     order_line.variant = variant_with_image
@@ -558,7 +552,7 @@ def test_order_query_variant_image_size_given_proxy_url_returned(
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{site_settings.site.domain}/thumbnail/{media_id}/128/"
+        == f"https://example.com/thumbnail/{media_id}/128/"
     )
 
 
@@ -567,7 +561,6 @@ def test_order_query_variant_image_size_given_thumbnail_url_returned(
     permission_group_manage_orders,
     order_line,
     variant_with_image,
-    site_settings,
 ):
     # given
     order_line.variant = variant_with_image
@@ -592,7 +585,7 @@ def test_order_query_variant_image_size_given_thumbnail_url_returned(
     assert len(order_data["lines"]) == 1
     assert (
         order_data["lines"][0]["thumbnail"]["url"]
-        == f"http://{site_settings.site.domain}/media/thumbnails/{thumbnail_mock.name}"
+        == f"https://example.com/media/thumbnails/{thumbnail_mock.name}"
     )
 
 
@@ -760,3 +753,159 @@ def test_order_query_undiscounted_prices_no_tax(
     first_order_data_line_price = order_data["lines"][0]["undiscountedUnitPrice"]
     assert first_order_data_line_price["net"]["amount"] == line.unit_price.net.amount
     assert first_order_data_line_price["gross"]["amount"] == line.unit_price.net.amount
+
+
+QUERY_WITH_LINE_DISCOUNTS = """
+    query OrderQuery($id: ID) {
+      order(id: $id) {
+        discounts {
+          id
+        }
+        lines {
+          discounts{
+            id
+            valueType
+            value
+            reason
+            unit{
+                amount
+            }
+            total{
+                amount
+            }
+          }
+        }
+      }
+    }
+    """
+
+
+def test_order_line_returns_discount_object(
+    staff_api_client, order_with_lines, permission_group_all_perms_all_channels
+):
+    # given
+    expected_amount = Decimal(6)
+    expected_reason = "test"
+
+    line = order_with_lines.lines.first()
+    line.discounts.create(
+        type=DiscountType.MANUAL,
+        value_type=DiscountValueType.FIXED,
+        value=expected_amount,
+        amount_value=expected_amount,
+        currency=line.currency,
+        reason=expected_reason,
+    )
+
+    permission_group_all_perms_all_channels.user_set.add(staff_api_client.user)
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_WITH_LINE_DISCOUNTS,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
+
+    # then
+    content = get_graphql_content(response)
+    line_discounts = content["data"]["order"]["lines"][0]["discounts"]
+
+    assert line_discounts
+    line_discount = line_discounts[0]
+    assert line_discount["valueType"] == DiscountValueType.FIXED.upper()
+    assert line_discount["reason"] == expected_reason
+    assert line_discount["value"] == expected_amount
+    assert line_discount["unit"]["amount"] == expected_amount / line.quantity
+    assert line_discount["total"]["amount"] == expected_amount
+
+
+def test_order_line_skips_voucher_discount_object_when_checkout_origin_and_legacy_flow(
+    staff_api_client,
+    order_with_lines,
+    permission_group_all_perms_all_channels,
+    channel_USD,
+):
+    # given
+    channel_USD.use_legacy_line_discount_propagation_for_order = True
+    channel_USD.save()
+
+    expected_amount = Decimal(6)
+    expected_reason = "test"
+
+    order_with_lines.origin = OrderOrigin.CHECKOUT
+    order_with_lines.save()
+
+    line = order_with_lines.lines.first()
+    line.discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=expected_amount,
+        amount_value=expected_amount,
+        currency=line.currency,
+        reason=expected_reason,
+    )
+
+    permission_group_all_perms_all_channels.user_set.add(staff_api_client.user)
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_WITH_LINE_DISCOUNTS,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
+
+    # then
+    content = get_graphql_content(response)
+    line_discounts = content["data"]["order"]["lines"][0]["discounts"]
+    assert len(line_discounts) == 0
+    assert content["data"]["order"]["discounts"]
+
+
+def test_order_line_skips_voucher_discount_object_when_checkout_origin(
+    staff_api_client,
+    order_with_lines,
+    permission_group_all_perms_all_channels,
+    channel_USD,
+):
+    # given
+    channel_USD.use_legacy_line_discount_propagation_for_order = False
+    channel_USD.save()
+
+    expected_amount = Decimal(6)
+    expected_reason = "test"
+
+    order_with_lines.origin = OrderOrigin.CHECKOUT
+    order_with_lines.save()
+
+    line = order_with_lines.lines.first()
+    line_discount = line.discounts.create(
+        type=DiscountType.VOUCHER,
+        value_type=DiscountValueType.FIXED,
+        value=expected_amount,
+        amount_value=expected_amount,
+        currency=line.currency,
+        reason=expected_reason,
+    )
+
+    permission_group_all_perms_all_channels.user_set.add(staff_api_client.user)
+
+    # when
+    response = staff_api_client.post_graphql(
+        QUERY_WITH_LINE_DISCOUNTS,
+        variables={"id": to_global_id_or_none(order_with_lines)},
+    )
+
+    # then
+    content = get_graphql_content(response)
+    line_discounts_data = content["data"]["order"]["lines"][0]["discounts"]
+    assert len(line_discounts_data) == 1
+    line_discount_data = line_discounts_data[0]
+
+    assert line_discount_data["id"] == to_global_id_or_none(line_discount)
+    assert line_discount_data["valueType"] == DiscountValueType.FIXED.upper()
+    assert line_discount_data["reason"] == expected_reason
+    assert (
+        line_discount_data["unit"]["amount"]
+        == line_discount.amount_value / line.quantity
+    )
+    assert line_discount_data["total"]["amount"] == line_discount.amount_value
+
+    assert not content["data"]["order"]["discounts"]

@@ -1,3 +1,5 @@
+from typing import Final
+
 import graphene
 from django.core.exceptions import ValidationError
 
@@ -6,12 +8,14 @@ from ....tax import error_codes, models
 from ...account.enums import CountryCodeEnum
 from ...core import ResolveInfo
 from ...core.doc_category import DOC_CATEGORY_TAXES
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import BaseInputObjectType, Error, NonNullList
 from ...core.utils import get_duplicates_items
 from ..types import TaxClass
 
-TaxClassUpdateErrorCode = graphene.Enum.from_enum(error_codes.TaxClassUpdateErrorCode)
+TaxClassUpdateErrorCode: Final[graphene.Enum] = graphene.Enum.from_enum(
+    error_codes.TaxClassUpdateErrorCode
+)
 TaxClassUpdateErrorCode.doc_category = DOC_CATEGORY_TAXES
 
 
@@ -63,7 +67,7 @@ class TaxClassUpdateInput(BaseInputObjectType):
         doc_category = DOC_CATEGORY_TAXES
 
 
-class TaxClassUpdate(ModelMutation):
+class TaxClassUpdate(DeprecatedModelMutation):
     class Arguments:
         id = graphene.ID(description="ID of the tax class.", required=True)
         input = TaxClassUpdateInput(
@@ -71,7 +75,7 @@ class TaxClassUpdate(ModelMutation):
         )
 
     class Meta:
-        description = "Update a tax class."
+        description = "Updates a tax class."
         error_type_class = TaxClassUpdateError
         model = models.TaxClass
         object_type = TaxClass
@@ -138,7 +142,7 @@ class TaxClassUpdate(ModelMutation):
         models.TaxClassCountryRate.objects.filter(country__in=country_codes).delete()
 
     @classmethod
-    def save(cls, _info, instance, cleaned_input):
+    def save(cls, _info, instance, cleaned_input, instance_tracker=None):
         instance.save()
         update_country_rates = cleaned_input.get("update_country_rates", [])
         remove_country_rates = cleaned_input.get("remove_country_rates", [])

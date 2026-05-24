@@ -2,13 +2,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from django.conf import settings
-from django.db.models import Exists, OuterRef
+from django.db.models import Exists, F, OuterRef
 
 from ..app.models import App
 from ..checkout import AddressType
+from ..core.tracing import traced_atomic_transaction
 from ..core.utils.events import call_event
 from ..permission.models import Permission
 from ..plugins.manager import get_plugins_manager
+from .lock_objects import user_qs_select_for_update
 from .models import Group, User
 
 if TYPE_CHECKING:
@@ -67,7 +69,6 @@ def store_user_address(
     if is_user_address_limit_reached(user):
         return
 
-    address = manager.change_user_address(address, address_type, user)
     address_data = address.as_data()
 
     address = user.addresses.filter(**address_data).first()
@@ -118,7 +119,6 @@ def set_user_default_shipping_address(user, address):
 def change_user_default_address(
     user: User, address: "Address", address_type: str, manager: "PluginsManager"
 ):
-    address = manager.change_user_address(address, address_type, user)
     if address_type == AddressType.BILLING:
         if user.default_billing_address:
             user.addresses.add(user.default_billing_address)
@@ -127,33 +127,6 @@ def change_user_default_address(
         if user.default_shipping_address:
             user.addresses.add(user.default_shipping_address)
         set_user_default_shipping_address(user, address)
-
-
-def create_superuser(credentials):
-    user, created = User.objects.get_or_create(
-        email=credentials["email"],
-        defaults={"is_active": True, "is_staff": True, "is_superuser": True},
-    )
-    if created:
-        user.set_password(credentials["password"])
-        user.save()
-        msg = f"Superuser - {credentials['email']}/{credentials['password']}"
-    else:
-        msg = f"Superuser already exists - {credentials['email']}"
-    return msg
-
-
-def remove_staff_member(staff):
-    """Remove staff member account only if it has no orders placed.
-
-    Otherwise, switches is_staff status to False.
-    """
-    if staff.orders.exists():
-        staff.is_staff = False
-        staff.user_permissions.clear()
-        staff.save()
-    else:
-        staff.delete()
 
 
 def retrieve_user_by_email(email):
@@ -196,3 +169,20 @@ def send_user_event(user: User, created: bool, updated: bool):
         event = manager.staff_updated if user.is_staff else manager.customer_updated
     if event:
         call_event(event, user)
+
+
+def update_user_orders_count(user_orders_count: dict[int, int]):
+    user_ids = [user_id for user_id, count in user_orders_count.items() if count > 0]
+    users_to_update = []
+    with traced_atomic_transaction():
+        users = user_qs_select_for_update().filter(id__in=user_ids)
+        users_in_bulk = users.in_bulk()
+        for user_id, count in user_orders_count.items():
+            if count > 0:
+                user = users_in_bulk.get(user_id)
+                if user:
+                    user.number_of_orders = F("number_of_orders") + count
+                    users_to_update.append(user)
+
+        if users_to_update:
+            User.objects.bulk_update(users_to_update, ["number_of_orders"])

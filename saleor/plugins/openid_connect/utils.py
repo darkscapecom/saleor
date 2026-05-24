@@ -17,7 +17,7 @@ from django.utils import timezone
 from jwt import PyJWTError
 
 from ...account.models import Group, User
-from ...account.search import prepare_user_search_document_value
+from ...account.search import update_user_search_vector
 from ...account.utils import get_user_groups_permissions, send_user_event
 from ...core.http_client import HTTPClient
 from ...core.jwt import (
@@ -388,6 +388,21 @@ def get_parsed_id_token(token_data, jwks_url) -> CodeIDToken:
         raise AuthenticationError("Token validation failed") from e
 
 
+def _invalidate_password_for_new_oidc_account(
+    user: User, oidc_metadata_key: str
+) -> None:
+    """Invalidate password for pre-existing user being claimed by OIDC for the first time.
+
+    When OIDC finds a user by email who wasn't previously linked to this OIDC provider,
+    the old password must be cleared to prevent login with stale credentials. This
+    handles the case where a staff account is deleted (soft-deleted with is_staff=False)
+    and later recreated via OIDC — without this, the old password would still work.
+    """
+    if not user.get_value_from_private_metadata(oidc_metadata_key):
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
+
+
 def get_or_create_user_from_payload(
     payload: dict,
     oauth_url: str,
@@ -412,6 +427,7 @@ def get_or_create_user_from_payload(
         "first_name": payload.get("given_name", ""),
         "last_name": payload.get("family_name", ""),
         "private_metadata": {oidc_metadata_key: sub},
+        "external_reference": sub,
         "password": make_password(None),
     }
     cache_key = oidc_metadata_key + ":" + sub
@@ -428,14 +444,18 @@ def get_or_create_user_from_payload(
             email=user_email,
             defaults=defaults_create,
         )
+        if not created:
+            _invalidate_password_for_new_oidc_account(user, oidc_metadata_key)
         match_orders_with_new_user(user)
 
     except User.MultipleObjectsReturned:
         logger.warning("Multiple users returned for single OIDC sub ID")
-        user, _ = User.objects.get_or_create(
+        user, created = User.objects.get_or_create(
             email=user_email,
             defaults=defaults_create,
         )
+        if not created:
+            _invalidate_password_for_new_oidc_account(user, oidc_metadata_key)
 
     # User logged in by OpenID are treated as confirmed by default so we only need to
     # check if user is active
@@ -486,7 +506,7 @@ def _update_user_details(
             return False
         user.email = user_email
         match_orders_with_new_user(user)
-        fields_to_save.update({"email", "search_document"})
+        fields_to_save.update({"email", "search_vector"})
 
     if last_login:
         if not user.last_login or user.last_login.timestamp() < last_login:
@@ -504,17 +524,15 @@ def _update_user_details(
 
     if user.first_name != user_first_name:
         user.first_name = user_first_name
-        fields_to_save.update({"first_name", "search_document"})
+        fields_to_save.update({"first_name", "search_vector"})
 
     if user.last_name != user_last_name:
         user.last_name = user_last_name
-        fields_to_save.update({"last_name", "search_document"})
+        fields_to_save.update({"last_name", "search_vector"})
 
-    if not user.search_document or "search_document" in fields_to_save:
-        user.search_document = prepare_user_search_document_value(
-            user, attach_addresses_data=False
-        )
-        fields_to_save.add("search_document")
+    if not user.search_vector or "search_vector" in fields_to_save:
+        update_user_search_vector(user, save=False)
+        fields_to_save.add("search_vector")
 
     if not user.is_confirmed:
         user.is_confirmed = True
@@ -552,7 +570,7 @@ def get_user_from_token(claims: CodeIDToken) -> User:
 
 def is_owner_of_token_valid(token: str, owner: str) -> bool:
     try:
-        payload = jwt_decode(token, verify_expiration=False)
+        payload = jwt_decode(token)
         return payload.get(JWT_OWNER_FIELD, "") == owner
     except Exception:
         return False
@@ -592,7 +610,7 @@ def validate_refresh_token(refresh_token, data):
         )
 
     try:
-        refresh_payload = jwt_decode(refresh_token, verify_expiration=True)
+        refresh_payload = jwt_decode(refresh_token)
     except PyJWTError as e:
         raise ValidationError(
             {

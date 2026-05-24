@@ -6,17 +6,23 @@ from django.test import override_settings
 
 from ...channel import MarkAsPaidStrategy
 from ...core.models import EventDelivery
-from ...core.utils.events import call_event_including_protected_events
+from ...core.utils.events import call_event
 from ...giftcard import GiftCardEvents
+from ...giftcard.const import GIFT_CARD_PAYMENT_GATEWAY_ID
 from ...giftcard.models import GiftCard, GiftCardEvent
 from ...order.fetch import OrderLineInfo, fetch_order_info
-from ...payment import ChargeStatus, PaymentError, TransactionEventType, TransactionKind
+from ...payment import (
+    ChargeStatus,
+    PaymentError,
+    TransactionAction,
+    TransactionEventType,
+    TransactionKind,
+)
 from ...payment.models import Payment
 from ...plugins.manager import get_plugins_manager
-from ...product.models import DigitalContent
-from ...product.tests.utils import create_image
 from ...warehouse.models import Allocation, Stock
 from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
+from ...webhook.transport.asynchronous.transport import generate_deferred_payloads
 from ...webhook.utils import get_webhooks_for_multiple_events
 from .. import (
     FulfillmentStatus,
@@ -27,12 +33,6 @@ from .. import (
 )
 from ..actions import (
     WEBHOOK_EVENTS_FOR_FULLY_PAID,
-    WEBHOOK_EVENTS_FOR_ORDER_CANCELED,
-    WEBHOOK_EVENTS_FOR_ORDER_CHARGED,
-    WEBHOOK_EVENTS_FOR_ORDER_CREATED,
-    WEBHOOK_EVENTS_FOR_ORDER_FULFILLED,
-    WEBHOOK_EVENTS_FOR_ORDER_REFUNDED,
-    automatically_fulfill_digital_lines,
     call_order_event,
     call_order_events,
     cancel_fulfillment,
@@ -53,60 +53,8 @@ from ..actions import (
     order_voided,
 )
 from ..fetch import OrderInfo
-from ..models import Fulfillment, OrderLine
-from ..notifications import (
-    send_fulfillment_confirmation_to_customer,
-    send_payment_confirmation,
-)
+from ..models import OrderLine
 from ..utils import updates_amounts_for_order
-
-
-@patch(
-    "saleor.order.actions.send_fulfillment_confirmation_to_customer",
-    wraps=send_fulfillment_confirmation_to_customer,
-)
-@patch(
-    "saleor.order.actions.send_payment_confirmation", wraps=send_payment_confirmation
-)
-@patch("saleor.plugins.manager.PluginsManager.fulfillment_created")
-def test_handle_fully_paid_order_digital_lines(
-    mock_fulfillment_created,
-    mock_send_payment_confirmation,
-    send_fulfillment_confirmation_to_customer,
-    order_with_digital_line,
-):
-    # given
-    order = order_with_digital_line
-    order.payments.add(Payment.objects.create())
-    redirect_url = "http://localhost.pl"
-    order = order_with_digital_line
-    order.redirect_url = redirect_url
-    order.save()
-    order_info = fetch_order_info(order)
-    manager = get_plugins_manager(allow_replica=False)
-
-    webhook_event_map = get_webhooks_for_multiple_events(WEBHOOK_EVENTS_FOR_FULLY_PAID)
-
-    # when
-    handle_fully_paid_order(manager, order_info, webhook_event_map=webhook_event_map)
-
-    # then
-    fulfillment = order.fulfillments.first()
-    assert set(order.events.values_list("type", flat=True)) == {
-        OrderEvents.ORDER_FULLY_PAID,
-        OrderEvents.FULFILLMENT_FULFILLED_ITEMS,
-    }
-    fulfilled_event = order.events.get(type=OrderEvents.FULFILLMENT_FULFILLED_ITEMS)
-    assert fulfilled_event.parameters["auto"] is True
-
-    mock_send_payment_confirmation.assert_called_once_with(order_info, manager)
-    send_fulfillment_confirmation_to_customer.assert_called_once_with(
-        order, fulfillment, user=order.user, app=None, manager=manager
-    )
-
-    order.refresh_from_db()
-    assert order.status == OrderStatus.FULFILLED
-    mock_fulfillment_created.assert_called_once_with(fulfillment)
 
 
 @patch("saleor.order.actions.send_payment_confirmation")
@@ -352,9 +300,10 @@ def test_handle_fully_paid_order_for_draft_order(
 
 
 @patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -363,14 +312,18 @@ def test_handle_fully_paid_order_for_draft_order(
 def test_handle_fully_paid_order_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     customer_user,
     settings,
     django_capture_on_commit_callbacks,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -383,6 +336,7 @@ def test_handle_fully_paid_order_triggers_webhooks(
             WebhookEventAsyncType.ORDER_FULLY_PAID,
         ]
     )
+
     order = order_with_lines
     order.status = OrderStatus.UNCONFIRMED
     order.should_refresh_prices = True
@@ -419,14 +373,13 @@ def test_handle_fully_paid_order_triggers_webhooks(
 
     order_deliveries = [order_updated_delivery, order_fully_paid_delivery]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -435,12 +388,20 @@ def test_handle_fully_paid_order_triggers_webhooks(
 
     # confirm each sync webhook was called without saving event delivery
     assert mocked_send_webhook_request_sync.call_count == 2
+
     assert not EventDelivery.objects.exclude(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -453,13 +414,6 @@ def test_handle_fully_paid_order_triggers_webhooks(
         == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [WebhookEventAsyncType.ORDER_FULLY_PAID, WebhookEventAsyncType.ORDER_UPDATED],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
 
 
 def test_mark_as_paid_with_payment(admin_user, draft_order):
@@ -559,7 +513,12 @@ def test_cancel_fulfillment(fulfilled_order, warehouse):
     line_1, line_2 = fulfillment.lines.all()
 
     cancel_fulfillment(
-        fulfillment, None, None, warehouse, get_plugins_manager(allow_replica=False)
+        fulfillment,
+        None,
+        None,
+        warehouse,
+        get_plugins_manager(allow_replica=False),
+        calculate_stocks_with_shipping_zones=True,
     )
 
     fulfillment.refresh_from_db()
@@ -570,7 +529,37 @@ def test_cancel_fulfillment(fulfilled_order, warehouse):
     assert line_2.order_line.quantity_fulfilled == 0
 
 
-def test_cancel_fulfillment_variant_witout_inventory_tracking(
+def test_cancel_fulfillment_waiting_for_approval(fulfilled_order):
+    # given
+    fulfillment = fulfilled_order.fulfillments.first()
+    fulfillment.status = FulfillmentStatus.WAITING_FOR_APPROVAL
+    fulfillment.save(update_fields=["status"])
+
+    fulfilled_order.status = OrderStatus.UNCONFIRMED
+    fulfilled_order.save(update_fields=["status"])
+    warehouse = None
+
+    # when
+    cancel_fulfillment(
+        fulfillment,
+        None,
+        None,
+        warehouse,
+        manager=get_plugins_manager(allow_replica=False),
+        calculate_stocks_with_shipping_zones=True,
+    )
+
+    # then
+    fulfillment.refresh_from_db()
+    fulfilled_order.refresh_from_db()
+    line_1, line_2 = fulfillment.lines.all()
+    assert fulfillment.status == FulfillmentStatus.CANCELED
+    assert fulfilled_order.status == OrderStatus.UNFULFILLED
+    assert line_1.order_line.quantity_fulfilled == 0
+    assert line_2.order_line.quantity_fulfilled == 0
+
+
+def test_cancel_fulfillment_variant_without_inventory_tracking(
     fulfilled_order_without_inventory_tracking, warehouse
 ):
     fulfillment = fulfilled_order_without_inventory_tracking.fulfillments.first()
@@ -579,7 +568,12 @@ def test_cancel_fulfillment_variant_witout_inventory_tracking(
     stock_quantity_before = stock.quantity
 
     cancel_fulfillment(
-        fulfillment, None, None, warehouse, get_plugins_manager(allow_replica=False)
+        fulfillment,
+        None,
+        None,
+        warehouse,
+        get_plugins_manager(allow_replica=False),
+        calculate_stocks_with_shipping_zones=True,
     )
 
     fulfillment.refresh_from_db()
@@ -596,6 +590,7 @@ def test_cancel_order(
     send_order_canceled_confirmation_mock,
     fulfilled_order_with_all_cancelled_fulfillments,
     django_capture_on_commit_callbacks,
+    site_settings,
 ):
     # given
     order = fulfilled_order_with_all_cancelled_fulfillments
@@ -607,7 +602,7 @@ def test_cancel_order(
 
     # when
     with django_capture_on_commit_callbacks(execute=True):
-        cancel_order(order, None, None, manager)
+        cancel_order(order, None, None, manager, site_settings)
 
     # then
     order_event = order.events.last()
@@ -624,8 +619,8 @@ def test_cancel_order(
 
 
 @patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
@@ -635,11 +630,12 @@ def test_cancel_order(
 def test_cancel_order_dont_trigger_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
+    site_settings,
 ):
     # given
     plugins_manager = get_plugins_manager(False)
@@ -655,10 +651,6 @@ def test_cancel_order_dont_trigger_webhooks(
         ]
     )
 
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_CANCELED
-    )
-
     order = order_with_lines
     order.status = OrderStatus.UNCONFIRMED
     order.should_refresh_prices = True
@@ -667,7 +659,7 @@ def test_cancel_order_dont_trigger_webhooks(
 
     # when
     with django_capture_on_commit_callbacks(execute=True):
-        cancel_order(order, None, None, plugins_manager)
+        cancel_order(order, None, None, plugins_manager, site_settings)
 
     # then
     # confirm that event delivery was generated for each async webhook.
@@ -692,30 +684,19 @@ def test_cancel_order_dont_trigger_webhooks(
         order_updated_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
         any_order=True,
     )
     assert not mocked_send_webhook_request_sync.called
-
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [
-            WebhookEventAsyncType.ORDER_CANCELLED,
-            WebhookEventAsyncType.ORDER_UPDATED,
-        ],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
 
 
 @patch("saleor.plugins.manager.PluginsManager.order_refunded")
@@ -787,9 +768,10 @@ def test_order_refunded_by_app(
 
 
 @patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -798,14 +780,18 @@ def test_order_refunded_by_app(
 def test_order_refunded_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
     app,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     mocked_send_webhook_request_sync.return_value = []
     (
         tax_webhook,
@@ -839,10 +825,6 @@ def test_order_refunded_triggers_webhooks(
     amount = order.total.gross.amount
     plugins_manager = get_plugins_manager(allow_replica=False)
 
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_REFUNDED
-    )
-
     # when
     with django_capture_on_commit_callbacks(execute=True):
         order_refunded(order, None, app, amount, payment, plugins_manager)
@@ -868,14 +850,13 @@ def test_order_refunded_triggers_webhooks(
         order_refunded_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -888,8 +869,15 @@ def test_order_refunded_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -903,22 +891,12 @@ def test_order_refunded_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [
-            WebhookEventAsyncType.ORDER_REFUNDED,
-            WebhookEventAsyncType.ORDER_UPDATED,
-            WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        ],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -927,14 +905,18 @@ def test_order_refunded_triggers_webhooks(
 def test_order_voided_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
     app,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     mocked_send_webhook_request_sync.return_value = []
     (
         tax_webhook,
@@ -968,12 +950,14 @@ def test_order_voided_triggers_webhooks(
         webhook_id=additional_order_webhook.id,
         event_type=WebhookEventAsyncType.ORDER_UPDATED,
     )
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_updated_delivery.id},
+        kwargs={
+            "event_delivery_id": order_updated_delivery.id,
+            "telemetry_context": ANY,
+        },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -982,8 +966,15 @@ def test_order_voided_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -997,26 +988,20 @@ def test_order_voided_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        order,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_order_fulfilled_dont_trigger_webhooks(
+def test_order_fulfilled_does_not_trigger_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     fulfilled_order,
     settings,
@@ -1036,10 +1021,6 @@ def test_order_fulfilled_dont_trigger_webhooks(
         [WebhookEventAsyncType.ORDER_UPDATED, WebhookEventAsyncType.ORDER_FULFILLED]
     )
     plugins_manager = get_plugins_manager(allow_replica=False)
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_FULFILLED
-    )
 
     # when
     with django_capture_on_commit_callbacks(execute=True):
@@ -1076,14 +1057,13 @@ def test_order_fulfilled_dont_trigger_webhooks(
         order_fulfilled_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1091,21 +1071,12 @@ def test_order_fulfilled_dont_trigger_webhooks(
     )
     assert not mocked_send_webhook_request_sync.called
 
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [
-            WebhookEventAsyncType.ORDER_UPDATED,
-            WebhookEventAsyncType.ORDER_FULFILLED,
-        ],
-        fulfilled_order,
-        webhook_event_map=webhook_event_map,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1114,15 +1085,19 @@ def test_order_fulfilled_dont_trigger_webhooks(
 def test_order_awaits_fulfillment_approval_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     fulfilled_order,
     settings,
     site_settings,
     django_capture_on_commit_callbacks,
     app,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     fulfillment = fulfilled_order.fulfillments.first()
     fulfillment.status = FulfillmentStatus.WAITING_FOR_APPROVAL
     fulfillment.save()
@@ -1162,12 +1137,14 @@ def test_order_awaits_fulfillment_approval_triggers_webhooks(
         event_type=WebhookEventAsyncType.ORDER_UPDATED,
     )
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_updated_delivery.id},
+        kwargs={
+            "event_delivery_id": order_updated_delivery.id,
+            "telemetry_context": ANY,
+        },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1176,8 +1153,15 @@ def test_order_awaits_fulfillment_approval_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -1191,17 +1175,12 @@ def test_order_awaits_fulfillment_approval_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        fulfilled_order,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1210,14 +1189,17 @@ def test_order_awaits_fulfillment_approval_triggers_webhooks(
 def test_order_authorized_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
     app,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
 
     order = order_with_lines
     order.status = OrderStatus.UNCONFIRMED
@@ -1255,12 +1237,14 @@ def test_order_authorized_triggers_webhooks(
         webhook_id=additional_order_webhook.id,
         event_type=WebhookEventAsyncType.ORDER_UPDATED,
     )
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_updated_delivery.id},
+        kwargs={
+            "event_delivery_id": order_updated_delivery.id,
+            "telemetry_context": ANY,
+        },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1269,8 +1253,15 @@ def test_order_authorized_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -1284,22 +1275,12 @@ def test_order_authorized_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        order,
-        webhook_event_map=None,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
-@patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
-)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1308,15 +1289,23 @@ def test_order_authorized_triggers_webhooks(
 def test_order_charged_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
     app,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
+    order = order_with_lines
+
+    # Turn off auto confirm as we want to check the webhooks
+    order.channel.automatically_confirm_all_new_orders = False
+    order.channel.save(update_fields=["automatically_confirm_all_new_orders"])
 
     order = order_with_lines
     order.status = OrderStatus.UNCONFIRMED
@@ -1335,10 +1324,6 @@ def test_order_charged_triggers_webhooks(
             WebhookEventAsyncType.ORDER_FULLY_PAID,
             WebhookEventAsyncType.ORDER_UPDATED,
         ]
-    )
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_CHARGED
     )
 
     plugins_manager = get_plugins_manager(allow_replica=False)
@@ -1371,14 +1356,13 @@ def test_order_charged_triggers_webhooks(
         order_paid_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1391,8 +1375,15 @@ def test_order_charged_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -1406,21 +1397,8 @@ def test_order_charged_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [WebhookEventAsyncType.ORDER_FULLY_PAID, WebhookEventAsyncType.ORDER_UPDATED],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_PAID,
-        order,
-        webhook_event_map=webhook_event_map,
-    )
 
-
-def test_fulfill_order_lines(order_with_lines):
+def test_fulfill_order_lines(order_with_lines, site_settings):
     order = order_with_lines
     line = order.lines.first()
     quantity_fulfilled_before = line.quantity_fulfilled
@@ -1437,7 +1415,8 @@ def test_fulfill_order_lines(order_with_lines):
                 warehouse_pk=stock.warehouse.pk,
             )
         ],
-        get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
 
     stock.refresh_from_db()
@@ -1445,7 +1424,7 @@ def test_fulfill_order_lines(order_with_lines):
     assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
 
 
-def test_fulfill_order_lines_multiple_lines(order_with_lines):
+def test_fulfill_order_lines_multiple_lines(order_with_lines, site_settings):
     order = order_with_lines
     lines = order.lines.all()
 
@@ -1476,7 +1455,8 @@ def test_fulfill_order_lines_multiple_lines(order_with_lines):
                 warehouse_pk=stock_2.warehouse.pk,
             ),
         ],
-        get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
 
     stock_1.refresh_from_db()
@@ -1492,7 +1472,7 @@ def test_fulfill_order_lines_multiple_lines(order_with_lines):
     )
 
 
-def test_fulfill_order_lines_with_variant_deleted(order_with_lines):
+def test_fulfill_order_lines_with_variant_deleted(order_with_lines, site_settings):
     line = order_with_lines.lines.first()
     line.variant.delete()
 
@@ -1500,11 +1480,14 @@ def test_fulfill_order_lines_with_variant_deleted(order_with_lines):
 
     fulfill_order_lines(
         [OrderLineInfo(line=line, quantity=line.quantity)],
-        get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
 
 
-def test_fulfill_order_lines_without_inventory_tracking(order_with_lines):
+def test_fulfill_order_lines_without_inventory_tracking(
+    order_with_lines, site_settings
+):
     order = order_with_lines
     line = order.lines.first()
     quantity_fulfilled_before = line.quantity_fulfilled
@@ -1525,117 +1508,13 @@ def test_fulfill_order_lines_without_inventory_tracking(order_with_lines):
                 warehouse_pk=stock.warehouse.pk,
             )
         ],
-        get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
 
     stock.refresh_from_db()
     assert stock.quantity == stock_quantity_after
     assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
-
-
-@patch("saleor.order.actions.send_fulfillment_confirmation_to_customer")
-@patch("saleor.order.utils.get_default_digital_content_settings")
-@patch("saleor.plugins.manager.PluginsManager.fulfillment_created")
-def test_fulfill_digital_lines(
-    mock_fulfillment_created,
-    mock_digital_settings,
-    mock_email_fulfillment,
-    order_with_lines,
-    media_root,
-):
-    mock_digital_settings.return_value = {"automatic_fulfillment": True}
-    line = order_with_lines.lines.all()[0]
-
-    image_file, image_name = create_image()
-    variant = line.variant
-
-    product_type = variant.product.product_type
-    product_type.is_digital = True
-    product_type.is_shipping_required = False
-    product_type.save(update_fields=["is_digital", "is_shipping_required"])
-
-    digital_content = DigitalContent.objects.create(
-        content_file=image_file, product_variant=variant, use_default_settings=True
-    )
-
-    line.variant.digital_content = digital_content
-    line.is_shipping_required = False
-    line.save()
-
-    order_with_lines.refresh_from_db()
-    order_info = fetch_order_info(order_with_lines)
-    manager = get_plugins_manager(allow_replica=False)
-
-    automatically_fulfill_digital_lines(order_info, manager)
-
-    line.refresh_from_db()
-    fulfillment = Fulfillment.objects.get(order=order_with_lines)
-    fulfillment_lines = fulfillment.lines.all()
-
-    assert fulfillment_lines.count() == 1
-    assert line.digital_content_url
-    assert mock_email_fulfillment.called
-    mock_fulfillment_created.assert_called_once_with(fulfillment)
-
-    event = order_with_lines.events.filter(
-        type=OrderEvents.FULFILLMENT_FULFILLED_ITEMS
-    ).first()
-    assert event
-    assert set(event.parameters["fulfilled_items"]) == {
-        line.pk for line in fulfillment_lines
-    }
-
-
-@patch("saleor.order.actions.send_fulfillment_confirmation_to_customer")
-@patch("saleor.order.utils.get_default_digital_content_settings")
-@patch("saleor.plugins.manager.PluginsManager.fulfillment_created")
-def test_fulfill_digital_lines_no_allocation(
-    mock_fulfillment_created,
-    mock_digital_settings,
-    mock_email_fulfillment,
-    order_with_lines,
-    media_root,
-):
-    # given
-    mock_digital_settings.return_value = {"automatic_fulfillment": True}
-    line = order_with_lines.lines.all()[0]
-
-    image_file, image_name = create_image()
-    variant = line.variant
-
-    product_type = variant.product.product_type
-    product_type.is_digital = True
-    product_type.is_shipping_required = False
-    product_type.save(update_fields=["is_digital", "is_shipping_required"])
-
-    digital_content = DigitalContent.objects.create(
-        content_file=image_file, product_variant=variant, use_default_settings=True
-    )
-
-    variant.digital_content = digital_content
-    variant.track_inventory = False
-    variant.save()
-
-    line.is_shipping_required = False
-    line.allocations.all().delete()
-    line.save()
-
-    order_with_lines.refresh_from_db()
-    order_info = fetch_order_info(order_with_lines)
-    manager = get_plugins_manager(allow_replica=False)
-
-    # when
-    automatically_fulfill_digital_lines(order_info, manager)
-
-    # then
-    line.refresh_from_db()
-    fulfillment = Fulfillment.objects.get(order=order_with_lines)
-    fulfillment_lines = fulfillment.lines.all()
-
-    assert fulfillment_lines.count() == 1
-    assert line.digital_content_url
-    assert mock_email_fulfillment.called
-    mock_fulfillment_created.assert_called_once_with(fulfillment)
 
 
 @patch("saleor.plugins.manager.PluginsManager.order_updated")
@@ -1676,13 +1555,10 @@ def test_order_transaction_updated_order_fully_paid(
 
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
-@patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
-)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1691,16 +1567,19 @@ def test_order_transaction_updated_order_fully_paid(
 def test_order_transaction_updated_for_charged_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     transaction_item_generator,
     django_capture_on_commit_callbacks,
     app,
     settings,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(allow_replica=False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -1714,14 +1593,15 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
             WebhookEventAsyncType.ORDER_UPDATED,
         ]
     )
+
     order = order_with_lines
+
+    order.channel.automatically_confirm_all_new_orders = False
+    order.channel.save(update_fields=["automatically_confirm_all_new_orders"])
+
     order.status = OrderStatus.UNCONFIRMED
     order.should_refresh_prices = True
     order.save(update_fields=["status", "should_refresh_prices"])
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_CHARGED
-    )
 
     order_info = fetch_order_info(order_with_lines)
     transaction_item = transaction_item_generator(
@@ -1767,14 +1647,13 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
         order_paid_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -1787,8 +1666,15 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -1802,24 +1688,12 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [WebhookEventAsyncType.ORDER_FULLY_PAID, WebhookEventAsyncType.ORDER_UPDATED],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_PAID,
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1828,15 +1702,19 @@ def test_order_transaction_updated_for_charged_triggers_webhooks(
 def test_order_transaction_updated_for_authorized_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     transaction_item_generator,
     django_capture_on_commit_callbacks,
     app,
     settings,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(allow_replica=False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -1850,10 +1728,6 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
     order.status = OrderStatus.UNCONFIRMED
     order.should_refresh_prices = True
     order.save(update_fields=["status", "should_refresh_prices"])
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        [WebhookEventAsyncType.ORDER_UPDATED, *WebhookEventSyncType.ORDER_EVENTS]
-    )
 
     order_info = fetch_order_info(order_with_lines)
     transaction_item = transaction_item_generator(
@@ -1884,12 +1758,14 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
         webhook_id=additional_order_webhook.id,
         event_type=WebhookEventAsyncType.ORDER_UPDATED,
     )
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_updated_delivery.id},
+        kwargs={
+            "event_delivery_id": order_updated_delivery.id,
+            "telemetry_context": ANY,
+        },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -1898,8 +1774,15 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -1913,18 +1796,12 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    wrapped_call_order_event.assert_called_once_with(
-        plugins_manager,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-
 
 @patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -1933,15 +1810,19 @@ def test_order_transaction_updated_for_authorized_triggers_webhooks(
 def test_order_transaction_updated_for_refunded_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     transaction_item_generator,
     django_capture_on_commit_callbacks,
     app,
     settings,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(allow_replica=False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -1955,14 +1836,11 @@ def test_order_transaction_updated_for_refunded_triggers_webhooks(
             WebhookEventAsyncType.ORDER_UPDATED,
         ]
     )
+
     order = order_with_lines
     order.status = OrderStatus.UNCONFIRMED
     order.should_refresh_prices = True
     order.save(update_fields=["status", "should_refresh_prices"])
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_REFUNDED
-    )
 
     order_info = fetch_order_info(order_with_lines)
     transaction_item = transaction_item_generator(
@@ -2008,14 +1886,13 @@ def test_order_transaction_updated_for_refunded_triggers_webhooks(
         order_refunded_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
@@ -2029,8 +1906,15 @@ def test_order_transaction_updated_for_refunded_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -2043,17 +1927,6 @@ def test_order_transaction_updated_for_refunded_triggers_webhooks(
         == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [
-            WebhookEventAsyncType.ORDER_REFUNDED,
-            WebhookEventAsyncType.ORDER_UPDATED,
-            WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        ],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
 
 
 @patch("saleor.plugins.manager.PluginsManager.order_updated")
@@ -2068,7 +1941,7 @@ def test_order_transaction_updated_order_partially_paid(
     # given
     order_info = fetch_order_info(order_with_lines)
     transaction_item = transaction_item_generator(
-        order_id=order_with_lines.pk, charged_value=Decimal("10")
+        order_id=order_with_lines.pk, charged_value=Decimal(10)
     )
     manager = get_plugins_manager(allow_replica=False)
     updates_amounts_for_order(
@@ -2104,11 +1977,9 @@ def test_order_transaction_updated_order_partially_paid_and_multiple_transaction
 ):
     # given
     order_info = fetch_order_info(order_with_lines)
-    transaction_item_generator(
-        order_id=order_with_lines.pk, charged_value=Decimal("10")
-    )
+    transaction_item_generator(order_id=order_with_lines.pk, charged_value=Decimal(10))
     transaction_item = transaction_item_generator(
-        order_id=order_with_lines.pk, charged_value=Decimal("5")
+        order_id=order_with_lines.pk, charged_value=Decimal(5)
     )
     manager = get_plugins_manager(allow_replica=False)
     updates_amounts_for_order(
@@ -2144,7 +2015,7 @@ def test_order_transaction_updated_with_the_same_transaction_charged_amount(
 ):
     # given
     order_info = fetch_order_info(order_with_lines)
-    charged_value = Decimal("5")
+    charged_value = Decimal(5)
 
     transaction_item = transaction_item_generator(
         order_id=order_with_lines.pk, charged_value=charged_value
@@ -2222,10 +2093,10 @@ def test_order_transaction_updated_order_partially_authorized_and_multiple_trans
     # given
     order_info = fetch_order_info(order_with_lines)
     transaction_item_generator(
-        order_id=order_with_lines.pk, authorized_value=Decimal("10")
+        order_id=order_with_lines.pk, authorized_value=Decimal(10)
     )
     transaction_item = transaction_item_generator(
-        order_id=order_with_lines.pk, authorized_value=Decimal("5")
+        order_id=order_with_lines.pk, authorized_value=Decimal(5)
     )
     manager = get_plugins_manager(allow_replica=False)
     updates_amounts_for_order(
@@ -2261,7 +2132,7 @@ def test_order_transaction_updated_with_the_same_transaction_authorized_amount(
 ):
     # given
     order_info = fetch_order_info(order_with_lines)
-    authorized_value = Decimal("5")
+    authorized_value = Decimal(5)
 
     transaction_item = transaction_item_generator(
         order_id=order_with_lines.pk, authorized_value=authorized_value
@@ -2374,12 +2245,10 @@ def test_order_transaction_updated_order_fully_refunded_and_multiple_transaction
 ):
     # given
     order_info = fetch_order_info(order_with_lines)
-    transaction_item_generator(
-        order_id=order_with_lines.pk, refunded_value=Decimal("10")
-    )
+    transaction_item_generator(order_id=order_with_lines.pk, refunded_value=Decimal(10))
     transaction_item = transaction_item_generator(
         order_id=order_with_lines.pk,
-        refunded_value=order_with_lines.total.gross.amount - Decimal("10"),
+        refunded_value=order_with_lines.total.gross.amount - Decimal(10),
     )
     manager = get_plugins_manager(allow_replica=False)
     updates_amounts_for_order(
@@ -2422,7 +2291,7 @@ def test_order_transaction_updated_order_fully_refunded_with_transaction_and_pay
     payment.save()
 
     payment.transactions.create(
-        amount=Decimal("10"),
+        amount=Decimal(10),
         currency=payment.currency,
         kind=TransactionKind.REFUND,
         gateway_response={},
@@ -2432,7 +2301,7 @@ def test_order_transaction_updated_order_fully_refunded_with_transaction_and_pay
     order_info = fetch_order_info(order_with_lines)
     transaction_item = transaction_item_generator(
         order_id=order_with_lines.pk,
-        refunded_value=order_with_lines.total.gross.amount - Decimal("10"),
+        refunded_value=order_with_lines.total.gross.amount - Decimal(10),
     )
 
     manager = get_plugins_manager(allow_replica=False)
@@ -2456,96 +2325,6 @@ def test_order_transaction_updated_order_fully_refunded_with_transaction_and_pay
     # then
     order_refunded.assert_called_once_with(order_with_lines, webhooks=set())
     order_fully_refunded.assert_called_once_with(order_with_lines, webhooks=set())
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_triggers_sync_webhook(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_event(
-            plugins_manager,
-            webhook_event,
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-
-    # confirm each sync webhook was called without saving event delivery
-    assert mocked_send_webhook_request_sync.call_count == 2
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
-    )
-
-    tax_delivery = tax_delivery_call.args[0]
-    assert tax_delivery.webhook_id == tax_webhook.id
-
-    filter_shipping_delivery = filter_shipping_call.args[0]
-    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
-    )
-
-    mocked_call_event_including_protected_events.assert_called_once_with(
-        ANY, order_with_lines, webhooks={order_webhook}
-    )
 
 
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
@@ -2589,274 +2368,27 @@ def test_call_order_event_incorrect_webhook_event(
     assert not mocked_send_webhook_request_sync.called
 
 
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-    ],
-)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
+@patch("saleor.order.actions.call_event", wraps=call_event)
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_missing_filter_shipping_method_webhook(
-    mocked_call_event_including_protected_events,
+def test_call_order_for_draft_order_deleted(
+    mocked_call_event,
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
+    mocked_cache,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
-    webhook_event,
+    setup_mock_for_cache,
 ):
     # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
+    setup_mock_for_cache({}, mocked_cache)
 
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    shipping_filter_webhook.is_active = False
-    shipping_filter_webhook.save(update_fields=["is_active"])
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_event(
-            plugins_manager,
-            webhook_event,
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-
-    mocked_send_webhook_request_sync.assert_called_once()
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    tax_delivery = mocked_send_webhook_request_sync.mock_calls[0].args[0]
-    assert tax_delivery.webhook_id == tax_webhook.id
-
-    mocked_call_event_including_protected_events.assert_called_once_with(
-        ANY, order_with_lines, webhooks={order_webhook}
-    )
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-        WebhookEventAsyncType.DRAFT_ORDER_CREATED,
-        WebhookEventAsyncType.DRAFT_ORDER_UPDATED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_skips_tax_webhook_when_prices_are_valid(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.save(
-        update_fields=[
-            "status",
-        ]
-    )
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_event(
-            plugins_manager,
-            webhook_event,
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-
-    # confirm each sync webhook was called without saving event delivery
-    mocked_send_webhook_request_sync.assert_called_once()
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    filter_shipping_call = mocked_send_webhook_request_sync.mock_calls[0]
-    filter_shipping_delivery = filter_shipping_call.args[0]
-    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
-    )
-    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    mocked_call_event_including_protected_events.assert_called_once_with(
-        ANY, order_with_lines, webhooks={order_webhook}
-    )
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-        WebhookEventAsyncType.DRAFT_ORDER_CREATED,
-        WebhookEventAsyncType.DRAFT_ORDER_UPDATED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_skips_sync_webhooks_when_order_not_editable(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNFULFILLED
-    order.save(
-        update_fields=[
-            "status",
-        ]
-    )
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_event(
-            plugins_manager,
-            webhook_event,
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-    assert not mocked_send_webhook_request_sync.called
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-    mocked_call_event_including_protected_events.assert_called_once_with(
-        ANY, order_with_lines, webhooks={order_webhook}
-    )
-
-
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_skips_sync_webhooks_when_draft_order_deleted(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-):
-    # given
     plugins_manager = get_plugins_manager(False)
     order = order_with_lines
     order.status = OrderStatus.DRAFT
@@ -2879,22 +2411,28 @@ def test_call_order_event_skips_sync_webhooks_when_draft_order_deleted(
 
     # then
     order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    tax_delivery = EventDelivery.objects.filter(webhook_id=tax_webhook.id).first()
-    filter_shipping_delivery = EventDelivery.objects.filter(
-        webhook_id=shipping_filter_webhook.id,
-        event_type=WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS,
-    ).first()
-    assert not filter_shipping_delivery
-    assert not tax_delivery
+
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
+        kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
-    assert not mocked_send_webhook_request_sync.called
-    mocked_call_event_including_protected_events.assert_called_once_with(
+
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+
+    filter_shipping_delivery = filter_shipping_call.args[0]
+    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
+    assert (
+        filter_shipping_delivery.event_type
+        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
+    )
+    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
+
+    mocked_call_event.assert_called_once_with(
         ANY, order_with_lines, webhooks={order_webhook}
     )
 
@@ -2950,167 +2488,8 @@ def test_call_order_event_skips_when_async_webhooks_missing(
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_event_skips_when_sync_webhooks_missing(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    order_with_lines,
-    settings,
-    webhook,
-    permission_manage_orders,
-    django_capture_on_commit_callbacks,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
-
-    webhook.app.permissions.add(permission_manage_orders)
-
-    mocked_send_webhook_request_sync.return_value = []
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_event(
-            plugins_manager,
-            WebhookEventAsyncType.ORDER_CREATED,
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-    assert not mocked_send_webhook_request_sync.called
-    mocked_call_event_including_protected_events.assert_called_once_with(
-        plugins_manager.order_created, order_with_lines, webhooks={webhook}
-    )
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_triggers_sync_webhook(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_events(
-            plugins_manager,
-            [
-                webhook_event,
-                WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-            ],
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-    # confirm each sync webhook was called without saving event delivery
-    assert mocked_send_webhook_request_sync.call_count == 2
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
-    )
-
-    tax_delivery = tax_delivery_call.args[0]
-    assert tax_delivery.webhook_id == tax_webhook.id
-
-    filter_shipping_delivery = filter_shipping_call.args[0]
-    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
-    )
-    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    mocked_call_event_including_protected_events.assert_has_calls(
-        [
-            call(
-                ANY,
-                order_with_lines,
-                webhooks={order_webhook},
-            ),
-            call(
-                plugins_manager.order_metadata_updated, order_with_lines, webhooks=set()
-            ),
-        ]
-    )
-
-
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
 def test_call_order_events_incorrect_webhook_event(
-    mocked_call_event_including_protected_events,
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
     setup_order_webhooks,
@@ -3147,317 +2526,29 @@ def test_call_order_events_incorrect_webhook_event(
     # then
     assert not mocked_send_webhook_request_async.called
     assert not mocked_send_webhook_request_sync.called
-    assert not mocked_call_event_including_protected_events.called
 
 
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-    ],
-)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
+@patch("saleor.order.actions.call_event", wraps=call_event)
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_missing_filter_shipping_method_webhook(
-    mocked_call_event_including_protected_events,
+def test_call_order_events_for_draft_order_deleted(
+    mocked_call_event,
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
+    mocked_cache,
     setup_order_webhooks,
     order_with_lines,
     settings,
     django_capture_on_commit_callbacks,
-    webhook_event,
+    setup_mock_for_cache,
 ):
     # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
+    setup_mock_for_cache({}, mocked_cache)
 
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    shipping_filter_webhook.is_active = False
-    shipping_filter_webhook.save(update_fields=["is_active"])
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_events(
-            plugins_manager,
-            [
-                webhook_event,
-                WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-            ],
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-
-    # confirm each sync webhook was called without saving event delivery
-    mocked_send_webhook_request_sync.assert_called_once()
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    tax_delivery = mocked_send_webhook_request_sync.mock_calls[0].args[0]
-    assert tax_delivery.webhook_id == tax_webhook.id
-
-    mocked_call_event_including_protected_events.assert_has_calls(
-        [
-            call(
-                ANY,
-                order_with_lines,
-                webhooks={order_webhook},
-            ),
-            call(
-                plugins_manager.order_metadata_updated, order_with_lines, webhooks=set()
-            ),
-        ]
-    )
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.DRAFT_ORDER_CREATED,
-        WebhookEventAsyncType.DRAFT_ORDER_UPDATED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_skips_tax_webhook_when_prices_are_valid(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.save(
-        update_fields=[
-            "status",
-        ]
-    )
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_events(
-            plugins_manager,
-            [
-                webhook_event,
-                WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-            ],
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-
-    # confirm each sync webhook was called without saving event delivery
-    mocked_send_webhook_request_sync.assert_called_once()
-    assert not EventDelivery.objects.exclude(webhook_id=order_webhook.id).exists()
-
-    filter_shipping_call = mocked_send_webhook_request_sync.mock_calls[0]
-    filter_shipping_delivery = filter_shipping_call.args[0]
-    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
-    )
-    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    mocked_call_event_including_protected_events.assert_has_calls(
-        [
-            call(
-                ANY,
-                order_with_lines,
-                webhooks={order_webhook},
-            ),
-            call(
-                plugins_manager.order_metadata_updated, order_with_lines, webhooks=set()
-            ),
-        ]
-    )
-
-
-@pytest.mark.parametrize(
-    "webhook_event",
-    [
-        WebhookEventAsyncType.ORDER_CREATED,
-        WebhookEventAsyncType.ORDER_CONFIRMED,
-        WebhookEventAsyncType.ORDER_PAID,
-        WebhookEventAsyncType.ORDER_FULLY_PAID,
-        WebhookEventAsyncType.ORDER_REFUNDED,
-        WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
-        WebhookEventAsyncType.ORDER_UPDATED,
-        WebhookEventAsyncType.ORDER_CANCELLED,
-        WebhookEventAsyncType.ORDER_EXPIRED,
-        WebhookEventAsyncType.ORDER_FULFILLED,
-        WebhookEventAsyncType.DRAFT_ORDER_CREATED,
-        WebhookEventAsyncType.DRAFT_ORDER_UPDATED,
-    ],
-)
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_skips_sync_webhooks_when_order_not_editable(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-    webhook_event,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNFULFILLED
-    order.save(
-        update_fields=[
-            "status",
-        ]
-    )
-
-    mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        order_webhook,
-    ) = setup_order_webhooks(webhook_event)
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_events(
-            plugins_manager,
-            [
-                webhook_event,
-                WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-            ],
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    tax_delivery = EventDelivery.objects.filter(webhook_id=tax_webhook.id).first()
-    filter_shipping_delivery = EventDelivery.objects.filter(
-        webhook_id=shipping_filter_webhook.id,
-        event_type=WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS,
-    ).first()
-    assert not filter_shipping_delivery
-    assert not tax_delivery
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-    assert not mocked_send_webhook_request_sync.called
-    mocked_call_event_including_protected_events.assert_has_calls(
-        [
-            call(
-                ANY,
-                order_with_lines,
-                webhooks={order_webhook},
-            ),
-            call(
-                plugins_manager.order_metadata_updated, order_with_lines, webhooks=set()
-            ),
-        ]
-    )
-
-
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
-@patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
-)
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_skips_sync_webhooks_when_draft_order_deleted(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    setup_order_webhooks,
-    order_with_lines,
-    settings,
-    django_capture_on_commit_callbacks,
-):
-    # given
     plugins_manager = get_plugins_manager(False)
     order = order_with_lines
     order.status = OrderStatus.DRAFT
@@ -3483,22 +2574,29 @@ def test_call_order_events_skips_sync_webhooks_when_draft_order_deleted(
 
     # then
     order_delivery = EventDelivery.objects.get(webhook_id=order_webhook.id)
-    tax_delivery = EventDelivery.objects.filter(webhook_id=tax_webhook.id).first()
-    filter_shipping_delivery = EventDelivery.objects.filter(
-        webhook_id=shipping_filter_webhook.id,
-        event_type=WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS,
-    ).first()
-    assert not filter_shipping_delivery
-    assert not tax_delivery
+
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
+        kwargs={"event_delivery_id": order_delivery.id, "telemetry_context": ANY},
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
-    assert not mocked_send_webhook_request_sync.called
-    mocked_call_event_including_protected_events.assert_has_calls(
+    assert mocked_send_webhook_request_sync.call_count == 1
+
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+
+    filter_shipping_delivery = filter_shipping_call.args[0]
+    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
+    assert (
+        filter_shipping_delivery.event_type
+        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
+    )
+    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
+
+    mocked_call_event.assert_has_calls(
         [
             call(
                 plugins_manager.draft_order_deleted,
@@ -3517,7 +2615,7 @@ def test_call_order_events_skips_sync_webhooks_when_draft_order_deleted(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_skips_when_async_webhooks_missing(
+def test_call_order_events_when_async_webhooks_missing(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
     setup_order_webhooks,
@@ -3533,11 +2631,8 @@ def test_call_order_events_skips_when_async_webhooks_missing(
     order.save(update_fields=["status", "should_refresh_prices"])
 
     mocked_send_webhook_request_sync.return_value = []
-    (
-        tax_webhook,
-        shipping_filter_webhook,
-        checkout_webhook,
-    ) = setup_order_webhooks(WebhookEventAsyncType.CHECKOUT_CREATED)
+
+    setup_order_webhooks(WebhookEventAsyncType.CHECKOUT_CREATED)
 
     # when
     with django_capture_on_commit_callbacks(execute=True):
@@ -3551,107 +2646,167 @@ def test_call_order_events_skips_when_async_webhooks_missing(
         )
 
     # then
-    tax_delivery = EventDelivery.objects.filter(webhook_id=tax_webhook.id).first()
-    filter_shipping_delivery = EventDelivery.objects.filter(
-        webhook_id=shipping_filter_webhook.id,
-        event_type=WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS,
-    ).first()
-    assert not filter_shipping_delivery
-    assert not tax_delivery
     assert not mocked_send_webhook_request_async.called
     assert not mocked_send_webhook_request_sync.called
 
 
-@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
-    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
-@patch(
-    "saleor.order.actions.call_event_including_protected_events",
-    wraps=call_event_including_protected_events,
-)
-@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_call_order_events_skips_when_sync_webhooks_missing(
-    mocked_call_event_including_protected_events,
-    mocked_send_webhook_request_async,
-    mocked_send_webhook_request_sync,
-    order_with_lines,
-    settings,
-    webhook,
-    permission_manage_orders,
-    django_capture_on_commit_callbacks,
-):
-    # given
-    plugins_manager = get_plugins_manager(False)
-    order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.save(update_fields=["status", "should_refresh_prices"])
-
-    webhook.app.permissions.add(permission_manage_orders)
-
-    mocked_send_webhook_request_sync.return_value = []
-
-    # when
-    with django_capture_on_commit_callbacks(execute=True):
-        call_order_events(
-            plugins_manager,
-            [
-                WebhookEventAsyncType.ORDER_CREATED,
-                WebhookEventAsyncType.ORDER_METADATA_UPDATED,
-            ],
-            order,
-        )
-
-    # then
-    order_delivery = EventDelivery.objects.get(webhook_id=webhook.id)
-    mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_delivery.id},
-        queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
-    )
-    assert not mocked_send_webhook_request_sync.called
-    mocked_call_event_including_protected_events.assert_has_calls(
-        [
-            call(
-                plugins_manager.order_created,
-                order_with_lines,
-                webhooks={webhook},
-            ),
-            call(
-                plugins_manager.order_metadata_updated, order_with_lines, webhooks=set()
-            ),
-        ]
-    )
-
-
-@patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
-)
-@patch(
-    "saleor.order.actions.call_order_events",
-    wraps=call_order_events,
-)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
 )
 @override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
-def test_order_created_triggers_webhooks(
+def test_unconfirmed_order_created_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_events,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     customer_user,
     settings,
     django_capture_on_commit_callbacks,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
+    plugins_manager = get_plugins_manager(False)
+    mocked_send_webhook_request_sync.return_value = []
+    (
+        tax_webhook,
+        shipping_filter_webhook,
+        additional_order_webhook,
+    ) = setup_order_webhooks(
+        [
+            WebhookEventAsyncType.ORDER_CREATED,
+            WebhookEventAsyncType.ORDER_PAID,
+            WebhookEventAsyncType.ORDER_UPDATED,
+            WebhookEventAsyncType.ORDER_FULLY_PAID,
+            WebhookEventAsyncType.ORDER_CONFIRMED,
+        ]
+    )
+
+    order = order_with_lines
+
+    order.channel.automatically_confirm_all_new_orders = False
+    order.channel.save(update_fields=["automatically_confirm_all_new_orders"])
+
+    order.status = OrderStatus.UNCONFIRMED
+    order.should_refresh_prices = True
+    order.charge_status = OrderChargeStatus.FULL
+    order.user = customer_user
+    order.save(
+        update_fields=["status", "should_refresh_prices", "charge_status", "user"]
+    )
+
+    user_number_of_orders = customer_user.number_of_orders
+
+    order_info = OrderInfo(
+        order=order,
+        customer_email=order.get_customer_email(),
+        channel=order.channel,
+        payment=order.get_last_payment(),
+        lines_data=[],
+    )
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_created(order_info, user=customer_user, app=None, manager=plugins_manager)
+
+    # then
+    # confirm that event delivery was generated for each async webhook.
+    order_updated_delivery = EventDelivery.objects.get(
+        webhook_id=additional_order_webhook.id,
+        event_type=WebhookEventAsyncType.ORDER_CREATED,
+    )
+    order_paid_delivery = EventDelivery.objects.get(
+        webhook_id=additional_order_webhook.id,
+        event_type=WebhookEventAsyncType.ORDER_PAID,
+    )
+    order_fully_paid_delivery = EventDelivery.objects.get(
+        webhook_id=additional_order_webhook.id,
+        event_type=WebhookEventAsyncType.ORDER_FULLY_PAID,
+    )
+
+    order_deliveries = [
+        order_updated_delivery,
+        order_paid_delivery,
+        order_fully_paid_delivery,
+    ]
+
+    assert wrapped_generate_deferred_payloads.called
+    mocked_send_webhook_request_async.assert_has_calls(
+        [
+            call(
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
+                queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
+                MessageGroupId="example.com:saleorappadditional",
+            )
+            for delivery in order_deliveries
+        ],
+        any_order=True,
+    )
+    # confirm each sync webhook was called without saving event delivery
+    assert mocked_send_webhook_request_sync.call_count == 2
+    assert not EventDelivery.objects.exclude(
+        webhook_id=additional_order_webhook.id
+    ).exists()
+
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
+    )
+
+    tax_delivery = tax_delivery_call.args[0]
+    assert tax_delivery.webhook_id == tax_webhook.id
+
+    filter_shipping_delivery = filter_shipping_call.args[0]
+    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
+    assert (
+        filter_shipping_delivery.event_type
+        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
+    )
+    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
+    customer_user.refresh_from_db()
+    assert customer_user.number_of_orders == user_number_of_orders + 1
+
+
+@patch(
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
+)
+@patch("saleor.webhook.transport.synchronous.transport.cache")
+@patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
+@patch(
+    "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
+)
+@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
+def test_confirmed_order_created_triggers_webhooks(
+    mocked_send_webhook_request_async,
+    mocked_send_webhook_request_sync,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
+    setup_order_webhooks,
+    order_with_lines,
+    customer_user,
+    settings,
+    django_capture_on_commit_callbacks,
+    setup_mock_for_cache,
+):
+    # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -3668,23 +2823,26 @@ def test_order_created_triggers_webhooks(
         ]
     )
     order = order_with_lines
-    order.status = OrderStatus.UNCONFIRMED
-    order.should_refresh_prices = True
-    order.charge_status = OrderChargeStatus.FULL
-    order.save(update_fields=["status", "should_refresh_prices", "charge_status"])
 
     order.channel.automatically_confirm_all_new_orders = True
     order.channel.save(update_fields=["automatically_confirm_all_new_orders"])
+
+    order.status = OrderStatus.UNCONFIRMED
+    order.should_refresh_prices = True
+    order.charge_status = OrderChargeStatus.FULL
+    order.user = customer_user
+    order.save(
+        update_fields=["status", "should_refresh_prices", "charge_status", "user"]
+    )
+
+    user_number_of_orders = customer_user.number_of_orders
+
     order_info = OrderInfo(
         order=order,
         customer_email=order.get_customer_email(),
         channel=order.channel,
         payment=order.get_last_payment(),
         lines_data=[],
-    )
-
-    webhook_event_map = get_webhooks_for_multiple_events(
-        WEBHOOK_EVENTS_FOR_ORDER_CREATED
     )
 
     # when
@@ -3717,75 +2875,30 @@ def test_order_created_triggers_webhooks(
         order_fully_paid_delivery,
     ]
 
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_has_calls(
         [
             call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={"event_delivery_id": delivery.id, "telemetry_context": ANY},
                 queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId="example.com:saleorappadditional",
             )
             for delivery in order_deliveries
         ],
         any_order=True,
     )
-    # confirm each sync webhook was called without saving event delivery
-    assert mocked_send_webhook_request_sync.call_count == 2
-    assert not EventDelivery.objects.exclude(
-        webhook_id=additional_order_webhook.id
-    ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
-    )
+    assert not mocked_send_webhook_request_sync.called
 
-    tax_delivery = tax_delivery_call.args[0]
-    assert tax_delivery.webhook_id == tax_webhook.id
-
-    filter_shipping_delivery = filter_shipping_call.args[0]
-    assert filter_shipping_delivery.webhook_id == shipping_filter_webhook.id
-    assert (
-        filter_shipping_delivery.event_type
-        == WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS
-    )
-    assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
-
-    wrapped_call_order_events.assert_called_once_with(
-        plugins_manager,
-        [WebhookEventAsyncType.ORDER_FULLY_PAID, WebhookEventAsyncType.ORDER_UPDATED],
-        order,
-        webhook_event_map=webhook_event_map,
-    )
-    wrapped_call_order_event.assert_has_calls(
-        [
-            call(
-                plugins_manager,
-                WebhookEventAsyncType.ORDER_CREATED,
-                order,
-                webhook_event_map=webhook_event_map,
-            ),
-            call(
-                plugins_manager,
-                WebhookEventAsyncType.ORDER_CONFIRMED,
-                order,
-                webhook_event_map=webhook_event_map,
-            ),
-            call(
-                plugins_manager,
-                WebhookEventAsyncType.ORDER_PAID,
-                order,
-                webhook_event_map=webhook_event_map,
-            ),
-        ],
-        any_order=True,
-    )
+    customer_user.refresh_from_db()
+    assert customer_user.number_of_orders == user_number_of_orders + 1
 
 
 @patch(
-    "saleor.order.actions.call_order_event",
-    wraps=call_order_event,
+    "saleor.webhook.transport.asynchronous.transport.generate_deferred_payloads.apply_async",
+    wraps=generate_deferred_payloads.apply_async,
 )
+@patch("saleor.webhook.transport.synchronous.transport.cache")
 @patch("saleor.webhook.transport.synchronous.transport.send_webhook_request_sync")
 @patch(
     "saleor.webhook.transport.asynchronous.transport.send_webhook_request_async.apply_async"
@@ -3794,14 +2907,18 @@ def test_order_created_triggers_webhooks(
 def test_order_confirmed_triggers_webhooks(
     mocked_send_webhook_request_async,
     mocked_send_webhook_request_sync,
-    wrapped_call_order_event,
+    mocked_cache,
+    wrapped_generate_deferred_payloads,
     setup_order_webhooks,
     order_with_lines,
     customer_user,
     settings,
     django_capture_on_commit_callbacks,
+    setup_mock_for_cache,
 ):
     # given
+    setup_mock_for_cache({}, mocked_cache)
+
     plugins_manager = get_plugins_manager(False)
     mocked_send_webhook_request_sync.return_value = []
     (
@@ -3829,12 +2946,14 @@ def test_order_confirmed_triggers_webhooks(
         webhook_id=additional_order_webhook.id,
         event_type=WebhookEventAsyncType.ORDER_CONFIRMED,
     )
+    assert wrapped_generate_deferred_payloads.called
     mocked_send_webhook_request_async.assert_called_once_with(
-        kwargs={"event_delivery_id": order_confirmed_delivery.id},
+        kwargs={
+            "event_delivery_id": order_confirmed_delivery.id,
+            "telemetry_context": ANY,
+        },
         queue=settings.ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME,
-        bind=True,
-        retry_backoff=10,
-        retry_kwargs={"max_retries": 5},
+        MessageGroupId="example.com:saleorappadditional",
     )
 
     # confirm each sync webhook was called without saving event delivery
@@ -3843,8 +2962,15 @@ def test_order_confirmed_triggers_webhooks(
         webhook_id=additional_order_webhook.id
     ).exists()
 
-    tax_delivery_call, filter_shipping_call = (
-        mocked_send_webhook_request_sync.mock_calls
+    filter_shipping_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == shipping_filter_webhook.id
+    )
+    tax_delivery_call = next(
+        call
+        for call in mocked_send_webhook_request_sync.mock_calls
+        if call.args[0].webhook_id == tax_webhook.id
     )
 
     tax_delivery = tax_delivery_call.args[0]
@@ -3858,4 +2984,214 @@ def test_order_confirmed_triggers_webhooks(
     )
     assert filter_shipping_call.kwargs["timeout"] == settings.WEBHOOK_SYNC_TIMEOUT
 
-    assert wrapped_call_order_event.called
+
+def test_order_confirmed_charges_funds_authorized_from_gift_card(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    balance = Decimal(100)
+    gift_card_created_by_staff.current_balance_amount = balance
+    gift_card_created_by_staff.save(update_fields=["current_balance_amount"])
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=order.total_gross_amount,
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    assert transaction.authorized_value == order.total_gross_amount
+    assert transaction.charged_value == Decimal(0)
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == order.total_gross_amount
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert (
+        gift_card_created_by_staff.current_balance_amount
+        == Decimal(100) - order.total_gross_amount
+    )
+    assert gift_card_created_by_staff.used_by == order.user
+    assert gift_card_created_by_staff.used_by_email == order.user_email
+    assert gift_card_created_by_staff.last_used_on is not None
+
+    transaction.events.get(type=TransactionEventType.CHARGE_REQUEST)
+    charge_success_event = transaction.events.get(
+        type=TransactionEventType.CHARGE_SUCCESS
+    )
+    assert charge_success_event.message == "Gift card (ending: taff)."
+
+    assert order.authorize_status == OrderAuthorizeStatus.FULL
+    assert order.charge_status == OrderChargeStatus.FULL
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == order.total_gross_amount
+
+    gift_card_event = GiftCardEvent.objects.get(
+        gift_card=gift_card_created_by_staff, type=GiftCardEvents.USED_IN_ORDER
+    )
+    assert gift_card_event.order == order
+    assert Decimal(gift_card_event.parameters["balance"]["old_current_balance"]) == (
+        balance
+    )
+    assert Decimal(gift_card_event.parameters["balance"]["current_balance"]) == (
+        balance - order.total_gross_amount
+    )
+
+
+def test_order_confirmed_checks_gift_card_funds_amount_when_charging_funds_authorized_from_gift_card(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=Decimal(10),
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    assert transaction.authorized_value == Decimal(10)
+    assert transaction.charged_value == Decimal(0)
+
+    gift_card_created_by_staff.current_balance_amount = Decimal(5)
+    gift_card_created_by_staff.save(update_fields=["current_balance_amount"])
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(10)
+    assert transaction.charged_value == Decimal(0)
+    assert transaction.available_actions == [TransactionAction.CANCEL]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(5)
+
+    transaction.events.get(type=TransactionEventType.CHARGE_REQUEST)
+    charge_success_event = transaction.events.get(
+        type=TransactionEventType.CHARGE_FAILURE
+    )
+    assert (
+        charge_success_event.message
+        == "Gift card has insufficient amount (5.00) to cover requested amount (10.00)."
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.NONE
+    assert order.total_authorized_amount == Decimal(10)
+    assert order.total_charged_amount == Decimal(0)
+
+    assert not GiftCardEvent.objects.filter(
+        gift_card=gift_card_created_by_staff, type=GiftCardEvents.USED_IN_ORDER
+    ).exists()
+
+
+def test_order_confirmed_does_not_charge_the_same_authorized_funds_more_than_once(
+    order_with_lines,
+    django_capture_on_commit_callbacks,
+    customer_user,
+    gift_card_created_by_staff,
+    transaction_item_generator,
+):
+    # given
+    order = order_with_lines
+    manager = get_plugins_manager(False)
+
+    transaction = transaction_item_generator(
+        app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+        order_id=order.pk,
+        gift_card=gift_card_created_by_staff,
+        authorized_value=Decimal(10),
+        available_actions=[TransactionAction.CANCEL],
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == Decimal(10)
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(0)
+
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_REQUEST).count() == 1
+    )
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_SUCCESS).count() == 1
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.PARTIAL
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == Decimal(10)
+
+    assert (
+        GiftCardEvent.objects.filter(
+            gift_card=gift_card_created_by_staff, type=GiftCardEvents.USED_IN_ORDER
+        ).count()
+        == 1
+    )
+
+    # when
+    with django_capture_on_commit_callbacks(execute=True):
+        order_confirmed(order, user=customer_user, app=None, manager=manager)
+
+    # then
+    transaction.refresh_from_db()
+    gift_card_created_by_staff.refresh_from_db()
+    order.refresh_from_db()
+
+    assert transaction.authorized_value == Decimal(0)
+    assert transaction.charged_value == Decimal(10)
+    assert transaction.available_actions == [TransactionAction.REFUND]
+    assert gift_card_created_by_staff.current_balance_amount == Decimal(0)
+
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_REQUEST).count() == 1
+    )
+    assert (
+        transaction.events.filter(type=TransactionEventType.CHARGE_SUCCESS).count() == 1
+    )
+
+    assert order.authorize_status == OrderAuthorizeStatus.PARTIAL
+    assert order.charge_status == OrderChargeStatus.PARTIAL
+
+    # Gift card event should still be exactly 1 (not duplicated by second confirmation)
+    assert (
+        GiftCardEvent.objects.filter(
+            gift_card=gift_card_created_by_staff, type=GiftCardEvents.USED_IN_ORDER
+        ).count()
+        == 1
+    )
+    assert order.total_authorized_amount == Decimal(0)
+    assert order.total_charged_amount == Decimal(10)

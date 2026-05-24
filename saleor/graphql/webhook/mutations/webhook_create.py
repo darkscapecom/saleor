@@ -17,7 +17,7 @@ from ...core import ResolveInfo
 from ...core.descriptions import DEPRECATED_IN_3X_INPUT
 from ...core.doc_category import DOC_CATEGORY_WEBHOOKS
 from ...core.fields import JSONString
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import BaseInputObjectType, NonNullList, WebhookError
 from ...core.utils import raise_validation_error
 from .. import enums
@@ -73,7 +73,7 @@ class WebhookCreateInput(BaseInputObjectType):
         doc_category = DOC_CATEGORY_WEBHOOKS
 
 
-class WebhookCreate(ModelMutation, NotifyUserEventValidationMixin):
+class WebhookCreate(DeprecatedModelMutation, NotifyUserEventValidationMixin):
     class Arguments:
         input = WebhookCreateInput(
             description="Fields required to create a webhook.", required=True
@@ -178,7 +178,7 @@ class WebhookCreate(ModelMutation, NotifyUserEventValidationMixin):
         return instance
 
     @classmethod
-    def save(cls, _info: ResolveInfo, instance, cleaned_input):
+    def save(cls, _info: ResolveInfo, instance, cleaned_input, instance_tracker=None):
         instance.save()
         events = set(cleaned_input.get("events", []))
         models.WebhookEvent.objects.bulk_create(

@@ -51,6 +51,9 @@ This query will have cost of 200 (100 x 2 for each product):
 { products(first: 100) { complexity } }
 """
 
+# GraphQL operations that fail before cost can be calculated have a fixed cost of 1.
+QUERY_COST_FAILED_OPERATION = 1
+
 COST_MAP = {
     "Query": {
         "address": {"complexity": 1},
@@ -72,8 +75,6 @@ COST_MAP = {
         "collection": {"complexity": 1},
         "collections": {"complexity": 1, "multipliers": ["first", "last"]},
         "customers": {"complexity": 1, "multipliers": ["first", "last"]},
-        "digitalContent": {"complexity": 1},
-        "digitalContents": {"complexity": 1, "multipliers": ["first", "last"]},
         "draftOrders": {"complexity": 1, "multipliers": ["first", "last"]},
         "exportFile": {"complexity": 1},
         "exportFiles": {"complexity": 1, "multipliers": ["first", "last"]},
@@ -135,13 +136,100 @@ COST_MAP = {
     },
     "App": {
         "extensions": {"complexity": 1},
+        "problems": {"complexity": 1, "multipliers": ["limit"]},
         "tokens": {"complexity": 1},
         "webhooks": {"complexity": 1},
+    },
+    "AssignedAttribute": {"attribute": {"complexity": 1}},
+    "AssignedNumericAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedTextAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+        "translation": {"complexity": 1},
+    },
+    "AssignedPlainTextAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+        "translation": {"complexity": 1},
+    },
+    "AssignedFileAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedChoiceAttributeValue": {
+        "translation": {"complexity": 1},
+    },
+    "AssignedSingleChoiceAttribute": {
+        "value": {"complexity": 1},
+    },
+    "AssignedMultiChoiceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedSwatchAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedBooleanAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedDateAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedDateTimeAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedMultiPageReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedMultiProductReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedMultiProductVariantReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedMultiCategoryReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedMultiCollectionReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1, "multipliers": ["limit"]},
+    },
+    "AssignedSinglePageReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedSingleProductReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedSingleProductVariantReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedSingleCategoryReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
+    },
+    "AssignedSingleCollectionReferenceAttribute": {
+        "attribute": {"complexity": 1},
+        "value": {"complexity": 1},
     },
     "Attribute": {
         "choices": {"complexity": 1, "multipliers": ["first", "last"]},
         "productTypes": {"complexity": 1, "multipliers": ["first", "last"]},
         "productVariantTypes": {"complexity": 1, "multipliers": ["first", "last"]},
+        "referenceTypes": {"complexity": 1, "multipliers": ["limit"]},
     },
     "Category": {
         "ancestors": {"complexity": 1, "multipliers": ["first", "last"]},
@@ -230,6 +318,7 @@ COST_MAP = {
         "variant": {"complexity": 1},
     },
     "Page": {
+        "assignedAttributes": {"complexity": 1, "multipliers": ["limit"]},
         "attributes": {"complexity": 1},
         "pageType": {"complexity": 1},
     },
@@ -242,6 +331,7 @@ COST_MAP = {
         "transactions": {"complexity": 1},
     },
     "Product": {
+        "assignedAttributes": {"complexity": 1, "multipliers": ["limit"]},
         "attributes": {"complexity": 1},
         "category": {"complexity": 1},
         "channelListings": {"complexity": 1},
@@ -274,6 +364,7 @@ COST_MAP = {
         "products": {"complexity": 1, "multipliers": ["first", "last"]},
     },
     "ProductVariant": {
+        "assignedAttributes": {"complexity": 1, "multipliers": ["limit"]},
         "attributes": {"complexity": 1},
         "channelListings": {"complexity": 1},
         "images": {"complexity": 1},
@@ -298,7 +389,7 @@ COST_MAP = {
     },
     "SelectedAttribute": {
         "attribute": {"complexity": 1},
-        "values": {"complexity": 1, "multipliers": ["first", "last"]},
+        "values": {"complexity": 1},
     },
     "ShippingMethodChannelListing": {
         "channel": {"complexity": 1},

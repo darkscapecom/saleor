@@ -29,7 +29,7 @@ class Decimal(graphene.Float):
         return None
 
     @staticmethod
-    def parse_value(value):
+    def parse_value(value) -> decimal.Decimal | None:
         try:
             # Converting the float to str before parsing it to Decimal is
             # necessary to keep the decimal places as typed
@@ -46,18 +46,29 @@ class Decimal(graphene.Float):
             return None
 
 
-class PositiveDecimal(Decimal):
+class PositiveDecimal(graphene.Float):
     """Nonnegative Decimal scalar implementation.
 
     Should be used in places where value must be nonnegative (0 or greater).
     """
 
     @staticmethod
-    def parse_value(value):
-        value = Decimal.parse_value(value)
-        if value and value < 0:
-            return None
-        return value
+    def parse_value(value) -> decimal.Decimal | None:
+        parsed_value = Decimal.parse_value(value)
+
+        if (parsed_value is not None) and parsed_value >= 0:
+            return parsed_value
+
+        return None
+
+    @staticmethod
+    def parse_literal(node) -> decimal.Decimal | None:
+        parsed_value = Decimal.parse_literal(node)
+
+        if (parsed_value is not None) and parsed_value >= 0:
+            return parsed_value
+
+        return None
 
 
 class JSON(GenericScalar):
@@ -188,9 +199,63 @@ class Date(graphene.Date):
         return graphene.Date.parse_value(value)
 
 
-class Minute(graphene.Int):
+class NonNegativeInt(graphene.Int):
+    """Non-negative Integer scalar implementation.
+
+    Should be used in places where value must be non-negative (0 or greater).
+    """
+
+    @staticmethod
+    def parse_value(value) -> int | None:
+        parsed_value = graphene.Int.parse_value(value)
+
+        if (parsed_value is not None) and parsed_value >= 0:
+            return parsed_value
+
+        return None
+
+    @staticmethod
+    def parse_literal(node) -> int | None:
+        parsed_value = graphene.Int.parse_literal(node)
+
+        if (parsed_value is not None) and parsed_value >= 0:
+            return parsed_value
+
+        return None
+
+
+class Minute(NonNegativeInt):
     """The `Minute` scalar type represents number of minutes by integer value."""
 
 
-class Day(graphene.Int):
+class Hour(NonNegativeInt):
+    """The `Hour` scalar type represents number of hours by integer value."""
+
+
+class Day(NonNegativeInt):
     """The `Day` scalar type represents number of days by integer value."""
+
+
+class PositiveInt(graphene.Int):
+    """Positive Integer scalar implementation.
+
+    Should be used in places where value must be positive (greater than 0).
+    """
+
+    @staticmethod
+    def parse_value(value) -> int | None:
+        parsed_value = graphene.Int.parse_value(value)
+
+        if (parsed_value is not None) and parsed_value > 0:
+            return parsed_value
+
+        return None
+
+    @staticmethod
+    def parse_literal(node) -> int | None:
+        parsed_value = graphene.Int.parse_literal(node)
+
+        if (parsed_value is not None) and parsed_value > 0:
+            return parsed_value
+
+        return None

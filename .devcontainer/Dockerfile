@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update \
   && apt-get install -y \
   libffi8 \
-  libgdk-pixbuf2.0-0 \
+  libgdk-pixbuf-2.0-0\
   liblcms2-2 \
   libopenjp2-7 \
   libssl3 \
@@ -14,13 +14,18 @@ RUN apt-get update \
   libwebp7 \
   libpq5 \
   shared-mime-info \
-  mime-support \
-  pipx
+  libmagic1 \
+  # Required to allows to identify file types when handling file uploads
+  media-types
 
-RUN pipx ensurepath
+COPY --from=ghcr.io/astral-sh/uv:0.11.8@sha256:3b7b60a81d3c57ef471703e5c83fd4aaa33abcd403596fb22ab07db85ae91347 \
+  /uv /uvx /bin/
+ENV UV_COMPILE_BYTECODE=1 UV_SYSTEM_PYTHON=1 UV_PROJECT_ENVIRONMENT=/usr/local
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-install-project --no-editable
 
-WORKDIR /app
-RUN pipx install poetry==2.0.1
-RUN poetry config virtualenvs.create false
-COPY poetry.lock pyproject.toml /app/
-RUN poetry sync
+# Removes the default 'mypy' installed by the base image as it clashes with the
+# version in uv.lock
+RUN pipx uninstall mypy

@@ -17,6 +17,7 @@ from ..account.models import Address, Group, StaffNotificationRecipient
 from ..core import JobStatus
 from ..core.models import EventDelivery, EventDeliveryAttempt, EventPayload
 from ..core.payments import PaymentInterface
+from ..core.telemetry import initialize_telemetry, meter, tracer
 from ..csv.events import ExportEvents
 from ..csv.models import ExportEvent, ExportFile
 from ..discount import PromotionEvents
@@ -92,6 +93,50 @@ def _assert_num_queries(context, *, config, num, exact=True, info=None):
     else:
         msg += " (add -v option to show queries)"
     pytest.fail(msg)
+
+
+@pytest.fixture(scope="session")
+def initialize_test_telemetry():
+    initialize_telemetry()
+
+
+@pytest.fixture
+def trace_context_propagation(initialize_test_telemetry):
+    tracer._tracer._inject_context = True
+    yield
+    tracer._tracer._inject_context = False
+
+
+@pytest.fixture
+def get_test_spans(initialize_test_telemetry):
+    # Clear any existing spans from the buffer before test execution
+    tracer._tracer.span_exporter.clear()
+    yield tracer._tracer.span_exporter.get_finished_spans
+    # Clean up by clearing the buffer after test completion
+    tracer._tracer.span_exporter.clear()
+
+
+@pytest.fixture
+def get_test_metrics_data(initialize_test_telemetry):
+    # Clear any existing metrics data from the buffer before test execution
+    meter._meter.metric_reader.get_metrics_data()
+    yield meter._meter.metric_reader.get_metrics_data
+    # Clean up by clearing the buffer after test completion
+    meter._meter.metric_reader.get_metrics_data()
+
+
+@pytest.fixture(autouse=True)
+def clear_telemetry_data(initialize_test_telemetry):
+    """Clear telemetry data after each test.
+
+    Tests may execute code that produces metrics and/or traces. In our test suite
+    in-memory metric reader and in-memory span exporter are used. If they're not flushed
+    regularly we may end up with substantial amount of data stored in memory for no
+    reason.
+    """
+    yield
+    meter._meter.metric_reader.get_metrics_data()
+    tracer._tracer.span_exporter.clear()
 
 
 @pytest.fixture
@@ -561,18 +606,13 @@ def description_json():
     return {
         "blocks": [
             {
-                "key": "",
                 "data": {
                     "text": "E-commerce for the PWA era",
+                    "level": 2,
                 },
-                "text": "E-commerce for the PWA era",
-                "type": "header-two",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
+                "type": "header",
             },
             {
-                "key": "",
                 "data": {
                     "text": (
                         "A modular, high performance e-commerce storefront "
@@ -580,21 +620,14 @@ def description_json():
                     )
                 },
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
             },
             {
-                "key": "",
-                "data": {},
-                "text": "",
+                "data": {
+                    "text": "",
+                },
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
             },
             {
-                "key": "",
                 "data": {
                     "text": (
                         "Saleor is a rapidly-growing open source e-commerce platform "
@@ -607,36 +640,18 @@ def description_json():
                     ),
                 },
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
             },
             {
-                "key": "",
                 "data": {"text": ""},
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
             },
             {
-                "key": "",
                 "data": {
                     "text": "Get Saleor today!",
                 },
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [{"key": 0, "length": 17, "offset": 0}],
-                "inlineStyleRanges": [],
             },
         ],
-        "entityMap": {
-            "0": {
-                "data": {"href": "https://github.com/mirumee/saleor"},
-                "type": "LINK",
-                "mutability": "MUTABLE",
-            }
-        },
     }
 
 
@@ -645,20 +660,15 @@ def other_description_json():
     return {
         "blocks": [
             {
-                "key": "",
                 "data": {
                     "text": (
                         "A GRAPHQL-FIRST <b>ECOMMERCE</b> PLATFORM FOR PERFECTIONISTS"
                     ),
+                    "level": 2,
                 },
-                "text": "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS",
-                "type": "header-two",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
+                "type": "header",
             },
             {
-                "key": "",
                 "data": {
                     "text": (
                         "Saleor is powered by a GraphQL server running on "
@@ -666,12 +676,8 @@ def other_description_json():
                     ),
                 },
                 "type": "paragraph",
-                "depth": 0,
-                "entityRanges": [],
-                "inlineStyleRanges": [],
             },
         ],
-        "entityMap": {},
     }
 
 
@@ -689,18 +695,32 @@ def tax_line_data_response():
 
 
 @pytest.fixture
-def tax_data_response(tax_line_data_response):
-    return {
-        "currency": "PLN",
-        "total_net_amount": 12.34,
-        "total_gross_amount": 12.34,
-        "subtotal_net_amount": 12.34,
-        "subtotal_gross_amount": 12.34,
-        "shipping_price_gross_amount": 12.34,
-        "shipping_price_net_amount": 12.34,
-        "shipping_tax_rate": 23,
-        "lines": [tax_line_data_response] * 5,
-    }
+def tax_data_response(tax_data_response_factory):
+    return tax_data_response_factory()
+
+
+@pytest.fixture
+def tax_data_response_factory(tax_line_data_response):
+    def factory(
+        shipping_price_gross_amount=12.34,
+        shipping_price_net_amount=12.34,
+        shipping_tax_rate=23,
+        lines_length=5,
+    ):
+        lines = [tax_line_data_response] * lines_length
+        return {
+            "currency": "PLN",
+            "total_net_amount": 12.34,
+            "total_gross_amount": 12.34,
+            "subtotal_net_amount": 12.34,
+            "subtotal_gross_amount": 12.34,
+            "shipping_price_gross_amount": shipping_price_gross_amount,
+            "shipping_price_net_amount": shipping_price_net_amount,
+            "shipping_tax_rate": shipping_tax_rate,
+            "lines": lines,
+        }
+
+    return factory
 
 
 @pytest.fixture
@@ -1194,6 +1214,7 @@ def async_subscription_webhooks_with_root_objects(
     subscription_collection_metadata_updated_webhook,
     subscription_checkout_created_webhook,
     subscription_checkout_updated_webhook,
+    subscription_checkout_fully_authorized_webhook,
     subscription_checkout_fully_paid_webhook,
     subscription_checkout_metadata_updated_webhook,
     subscription_page_created_webhook,
@@ -1456,6 +1477,7 @@ def async_subscription_webhooks_with_root_objects(
         ],
         events.CUSTOMER_CREATED: [subscription_customer_created_webhook, customer_user],
         events.CUSTOMER_UPDATED: [subscription_customer_updated_webhook, customer_user],
+        events.CUSTOMER_DELETED: [subscription_customer_deleted_webhook, customer_user],
         events.CUSTOMER_METADATA_UPDATED: [
             subscription_customer_metadata_updated_webhook,
             customer_user,
@@ -1480,6 +1502,10 @@ def async_subscription_webhooks_with_root_objects(
         events.CHECKOUT_UPDATED: [subscription_checkout_updated_webhook, checkout],
         events.CHECKOUT_FULLY_PAID: [
             subscription_checkout_fully_paid_webhook,
+            checkout,
+        ],
+        events.CHECKOUT_FULLY_AUTHORIZED: [
+            subscription_checkout_fully_authorized_webhook,
             checkout,
         ],
         events.CHECKOUT_METADATA_UPDATED: [
@@ -1652,12 +1678,12 @@ def tax_configuration_flat_rates(channel_USD):
 
 
 @pytest.fixture
-def tax_configuration_tax_app(channel_USD):
+def tax_configuration_tax_app(channel_USD, tax_app):
     tc = channel_USD.tax_configuration
     tc.country_exceptions.all().delete()
     tc.prices_entered_with_tax = False
     tc.tax_calculation_strategy = TaxCalculationStrategy.TAX_APP
-    tc.tax_app_id = "avatax.app"
+    tc.tax_app_id = tax_app.identifier
     tc.save()
     return tc
 

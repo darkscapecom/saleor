@@ -186,7 +186,7 @@ def product_type_permissions(
 
 
 def order_permissions(_info: ResolveInfo, _object_pk: Any) -> list[BasePermissionEnum]:
-    return [OrderPermissions.MANAGE_ORDERS]
+    return [OrderPermissions.MANAGE_ORDERS, CheckoutPermissions.HANDLE_TAXES]
 
 
 def invoice_permissions(
@@ -230,7 +230,7 @@ def channel_permissions(
 def checkout_permissions(
     _info: ResolveInfo, _object_pk: Any
 ) -> list[BasePermissionEnum]:
-    return [CheckoutPermissions.MANAGE_CHECKOUTS]
+    return [CheckoutPermissions.MANAGE_CHECKOUTS, CheckoutPermissions.HANDLE_TAXES]
 
 
 def page_permissions(_info: ResolveInfo, _object_pk: Any) -> list[BasePermissionEnum]:
@@ -315,7 +315,6 @@ PUBLIC_META_PERMISSION_MAP: dict[
     "Checkout": no_permissions,
     "CheckoutLine": no_permissions,
     "Collection": product_permissions,
-    "DigitalContent": product_permissions,
     "Fulfillment": order_permissions,
     "GiftCard": gift_card_permissions,
     "Invoice": invoice_permissions,
@@ -355,7 +354,6 @@ PRIVATE_META_PERMISSION_MAP: dict[
     "Checkout": checkout_permissions,
     "CheckoutLine": checkout_permissions,
     "Collection": product_permissions,
-    "DigitalContent": product_permissions,
     "Fulfillment": order_permissions,
     "GiftCard": gift_card_permissions,
     "Invoice": invoice_permissions,

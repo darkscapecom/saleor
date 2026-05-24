@@ -6,9 +6,10 @@ from django.core.management import CommandError, call_command
 from django.db.utils import DataError
 from django.templatetags.static import static
 from django.test import RequestFactory, override_settings
+from django.utils.crypto import get_random_string
 
 from ...account.models import Address, User
-from ...account.utils import create_superuser
+from ...account.tests.fixtures.user import dangerously_get_or_create_superuser
 from ...attribute.models import AttributeValue
 from ...channel.models import Channel
 from ...discount.models import (
@@ -68,16 +69,19 @@ def test_get_client_ip(ip_address, expected_ip):
 
 
 def test_create_superuser(db, client, media_root):
-    credentials = {"email": "admin@example.com", "password": "admin"}
+    credentials = {
+        "email": "admin@example.com",
+        "password": get_random_string(length=50),
+    }
     # Test admin creation
     assert User.objects.all().count() == 0
-    create_superuser(credentials)
+    dangerously_get_or_create_superuser(**credentials)
     assert User.objects.all().count() == 1
     admin = User.objects.all().first()
     assert admin.is_superuser
     assert not admin.avatar
     # Test duplicating
-    create_superuser(credentials)
+    dangerously_get_or_create_superuser(**credentials)
     assert User.objects.all().count() == 1
 
 
@@ -107,7 +111,7 @@ def test_create_channels_with_default_channel_slug(db):
 
 def test_create_fake_user(db):
     assert User.objects.all().count() == 0
-    random_data.create_fake_user("password")
+    random_data.create_fake_user(get_random_string(length=50))
     assert User.objects.all().count() == 1
     user = User.objects.all().first()
     assert not user.is_superuser
@@ -115,7 +119,7 @@ def test_create_fake_user(db):
 
 def test_create_fake_users(db):
     how_many = 5
-    for _ in random_data.create_users("password", how_many):
+    for _ in random_data.create_users(get_random_string(length=50), how_many):
         pass
     assert User.objects.all().count() == 5
 
@@ -135,7 +139,7 @@ def test_create_fake_order(db, monkeypatch, image, media_root, warehouse):
         pass
     for _ in random_data.create_shipping_zones():
         pass
-    for _ in random_data.create_users("password", 3):
+    for _ in random_data.create_users(get_random_string(length=50), 3):
         pass
     for _ in random_data.create_page_type():
         pass
@@ -217,7 +221,7 @@ def test_storages_not_setting_s3_bucket_domain(storage, settings):
     assert storage.custom_domain is None
 
 
-def test_build_absolute_uri(site_settings, settings):
+def test_build_absolute_uri():
     # Case when we are using external service for storing static files,
     # eg. Amazon s3
     url = "https://example.com/static/images/image.jpg"
@@ -225,13 +229,14 @@ def test_build_absolute_uri(site_settings, settings):
 
     # Case when static url is resolved to relative url
     logo_url = build_absolute_uri(static("images/close.svg"))
-    protocol = "https" if settings.ENABLE_SSL else "http"
-    current_url = f"{protocol}://{site_settings.site.domain}"
+    current_url = "https://example.com/"
     logo_location = urljoin(current_url, static("images/close.svg"))
     assert logo_url == logo_location
 
 
-def test_build_absolute_uri_with_host(site_settings, settings):
+def test_build_absolute_uri_with_host(settings):
+    settings.PUBLIC_URL = None
+    settings.ENABLE_SSL = True
     # given
     host = "test.com"
     location = "images/close.svg"
@@ -240,7 +245,7 @@ def test_build_absolute_uri_with_host(site_settings, settings):
     url = build_absolute_uri(location, host)
 
     # then
-    assert url == f"http://{host}/{location}"
+    assert url == f"https://{host}/{location}"
 
 
 @pytest.mark.parametrize(
@@ -248,9 +253,7 @@ def test_build_absolute_uri_with_host(site_settings, settings):
 )
 @pytest.mark.parametrize("enable_ssl", [True, False])
 @pytest.mark.parametrize("host", [None, "test.com"])
-def test_build_absolute_uri_with_public_url(
-    public_url, enable_ssl, host, site_settings, settings
-):
+def test_build_absolute_uri_with_public_url(public_url, enable_ssl, host, settings):
     # given
     location = "images/close.svg"
     settings.PUBLIC_URL = public_url
@@ -261,9 +264,7 @@ def test_build_absolute_uri_with_public_url(
     assert url == f"{public_url}/{location}"
 
 
-def test_build_absolute_uri_with_public_url_and_absolute_location(
-    site_settings, settings
-):
+def test_build_absolute_uri_with_public_url_and_absolute_location(settings):
     # given
     location = "https://example.com/static/images/image.jpg"
     settings.PUBLIC_URL = "https://api.example.com"
@@ -275,6 +276,7 @@ def test_build_absolute_uri_with_public_url_and_absolute_location(
 
 @pytest.mark.parametrize("enable_ssl", [True, False])
 def test_is_ssl_enabled(enable_ssl, settings):
+    settings.PUBLIC_URL = None
     # given
     settings.ENABLE_SSL = enable_ssl
     # then
@@ -295,6 +297,7 @@ def test_is_ssl_enabled_with_public_url(public_url, expected, enable_ssl, settin
 
 
 def test_get_domain(site_settings, settings):
+    settings.PUBLIC_URL = None
     assert get_domain() == site_settings.site.domain
 
 

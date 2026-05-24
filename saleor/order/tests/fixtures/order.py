@@ -10,9 +10,11 @@ from prices import Money, TaxedMoney
 
 from ....checkout.utils import get_prices_of_discounted_specific_product
 from ....core import JobStatus
+from ....core.prices import quantize_price
 from ....core.taxes import zero_money
 from ....discount import DiscountType, RewardType, RewardValueType, VoucherType
 from ....discount.models import NotApplicable, Voucher
+from ....discount.utils.order import update_unit_discount_data_on_order_line
 from ....discount.utils.voucher import (
     get_products_voucher_discount,
     validate_voucher_in_order,
@@ -108,31 +110,37 @@ def orders(customer_user, channel_USD, channel_PLN):
                 user=customer_user,
                 status=OrderStatus.CANCELED,
                 channel=channel_USD,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.UNFULFILLED,
                 channel=channel_USD,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.PARTIALLY_FULFILLED,
                 channel=channel_USD,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.FULFILLED,
                 channel=channel_PLN,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.DRAFT,
                 channel=channel_PLN,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.UNCONFIRMED,
                 channel=channel_PLN,
+                lines_count=0,
             ),
         ]
     )
@@ -147,24 +155,28 @@ def orders_from_checkout(customer_user, checkout):
                 status=OrderStatus.CANCELED,
                 channel=checkout.channel,
                 checkout_token=checkout.token,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.UNFULFILLED,
                 channel=checkout.channel,
                 checkout_token=checkout.token,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.FULFILLED,
                 channel=checkout.channel,
                 checkout_token=checkout.token,
+                lines_count=0,
             ),
             Order(
                 user=customer_user,
                 status=OrderStatus.FULFILLED,
                 channel=checkout.channel,
                 checkout_token=checkout.token,
+                lines_count=0,
             ),
         ]
     )
@@ -201,6 +213,7 @@ def order_generator(customer_user, channel_USD):
             checkout_token=checkout_token,
             status=status,
             undiscounted_base_shipping_price_amount=Decimal("0.0"),
+            lines_count=0,
         )
         if search_vector_class:
             search_vector = search_vector_class(
@@ -219,6 +232,12 @@ def order(order_generator):
 
 
 @pytest.fixture
+def order_with_gift_card(order, gift_card):
+    order.gift_cards.add(gift_card)
+    return order
+
+
+@pytest.fixture
 def order_unconfirmed(order):
     order.status = OrderStatus.UNCONFIRMED
     order.save(update_fields=["status"])
@@ -234,12 +253,21 @@ def order_list(customer_user, channel_USD):
         "user_email": customer_user.email,
         "channel": channel_USD,
         "origin": OrderOrigin.CHECKOUT,
+        "lines_count": 0,
     }
     order = Order.objects.create(**data)
     order1 = Order.objects.create(**data)
     order2 = Order.objects.create(**data)
 
     return [order, order1, order2]
+
+
+@pytest.fixture
+def draft_order_list(order_list):
+    for order in order_list:
+        order.status = OrderStatus.DRAFT
+    Order.objects.bulk_update(order_list, ["status"])
+    return order_list
 
 
 @pytest.fixture
@@ -418,6 +446,7 @@ def order_with_lines(
     order.base_shipping_price = net
     order.undiscounted_base_shipping_price = net
     order.shipping_tax_rate = calculate_tax_rate(order.shipping_price)
+    order.lines_count = order.lines.count()
     order.save()
 
     recalculate_order(order)
@@ -469,6 +498,7 @@ def order_with_lines_for_cc(
         user_email=customer_user.email,
         user=customer_user,
         origin=OrderOrigin.CHECKOUT,
+        lines_count=1,
     )
 
     order.collection_point = warehouse_for_cc
@@ -517,6 +547,7 @@ def order_with_lines_and_catalogue_promotion(
     order_with_lines, channel_USD, catalogue_promotion_without_rules
 ):
     order = order_with_lines
+    currency = order.currency
     promotion = catalogue_promotion_without_rules
     line = order.lines.get(quantity=3)
     variant = line.variant
@@ -525,7 +556,7 @@ def order_with_lines_and_catalogue_promotion(
         name="Catalogue rule fixed",
         catalogue_predicate={
             "variantPredicate": {
-                "ids": [graphene.Node.to_global_id("ProductVariant", variant)]
+                "ids": [graphene.Node.to_global_id("ProductVariant", variant.id)]
             }
         },
         reward_value_type=RewardValueType.FIXED,
@@ -539,16 +570,36 @@ def order_with_lines_and_catalogue_promotion(
     listing.variantlistingpromotionrule.create(
         promotion_rule=rule,
         discount_amount=reward_value,
-        currency=order.currency,
+        currency=currency,
     )
 
-    line.discounts.create(
+    discount = line.discounts.create(
         type=DiscountType.PROMOTION,
         value_type=RewardValueType.FIXED,
         value=reward_value,
         amount_value=reward_value * line.quantity,
-        currency=order.currency,
+        currency=currency,
         promotion_rule=rule,
+        reason=f"Promotion: {graphene.Node.to_global_id('Promotion', promotion.id)}",
+    )
+
+    line.base_unit_price_amount = (
+        line.undiscounted_base_unit_price_amount - reward_value
+    )
+    total = quantize_price(line.base_unit_price_amount * line.quantity, currency)
+    line.total_price_net_amount = total
+    line.total_price_gross_amount = quantize_price(total * Decimal("1.23"), currency)
+    update_unit_discount_data_on_order_line(line, [discount])
+    line.save(
+        update_fields=[
+            "base_unit_price_amount",
+            "total_price_net_amount",
+            "total_price_gross_amount",
+            "unit_discount_amount",
+            "unit_discount_reason",
+            "unit_discount_type",
+            "unit_discount_value",
+        ]
     )
     return order
 
@@ -624,6 +675,8 @@ def order_with_lines_and_gift_promotion(
         amount_value=variant_listing.price_amount,
         currency=order.currency,
     )
+    order.lines_count = order.lines.count()
+    order.save(update_fields=["lines_count"])
     return order
 
 
@@ -674,6 +727,7 @@ def order_with_lines_channel_PLN(
         user_email=customer_user.email,
         user=customer_user,
         origin=OrderOrigin.CHECKOUT,
+        lines_count=0,
     )
     product = Product.objects.create(
         name="Test product in PLN channel",
@@ -795,6 +849,7 @@ def order_with_lines_channel_PLN(
     order.base_shipping_price = net
     order.undiscounted_base_shipping_price = net
     order.shipping_tax_rate = calculate_tax_rate(order.shipping_price)
+    order.lines_count = order.lines.count()
     order.save()
 
     recalculate_order(order)
@@ -834,6 +889,8 @@ def order_with_line_without_inventory_tracking(
         tax_rate=Decimal("0.23"),
         **get_tax_class_kwargs_for_order_line(product.product_type.tax_class),
     )
+    order.lines_count = order.lines.count()
+    order.save(update_fields=["lines_count"])
 
     recalculate_order(order)
 
@@ -911,6 +968,7 @@ def order_with_preorder_lines(
     order.shipping_price = TaxedMoney(net=net, gross=gross)
     order.base_shipping_price = net
     order.undiscounted_base_shipping_price = net
+    order.lines_count = order.lines.count()
     order.save()
 
     recalculate_order(order)
@@ -930,7 +988,7 @@ def order_events(order):
 
 
 @pytest.fixture
-def fulfilled_order(order_with_lines):
+def fulfilled_order(order_with_lines, site_settings):
     order = order_with_lines
     order.invoices.create(
         url="http://www.example.com/invoice.pdf",
@@ -956,7 +1014,8 @@ def fulfilled_order(order_with_lines):
                 line=line_2, quantity=line_2.quantity, warehouse_pk=warehouse_2_pk
             ),
         ],
-        manager=get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
     order.status = OrderStatus.FULFILLED
     order.save(update_fields=["status"])
@@ -974,6 +1033,7 @@ def unconfirmed_order_with_lines(order_with_lines):
 @pytest.fixture
 def fulfilled_order_without_inventory_tracking(
     order_with_line_without_inventory_tracking,
+    site_settings,
 ):
     order = order_with_line_without_inventory_tracking
     fulfillment = order.fulfillments.create(tracking_number="123")
@@ -983,7 +1043,8 @@ def fulfilled_order_without_inventory_tracking(
     fulfillment.lines.create(order_line=line, quantity=line.quantity, stock=stock)
     fulfill_order_lines(
         [OrderLineInfo(line=line, quantity=line.quantity, warehouse_pk=warehouse_pk)],
-        get_plugins_manager(allow_replica=False),
+        site_settings=site_settings,
+        requestor=None,
     )
     order.status = OrderStatus.FULFILLED
     order.save(update_fields=["status"])
@@ -1013,23 +1074,15 @@ def fulfilled_order_with_all_cancelled_fulfillments(
         None,
         warehouse,
         get_plugins_manager(allow_replica=False),
+        calculate_stocks_with_shipping_zones=True,
     )
     return fulfilled_order
 
 
 @pytest.fixture
-def order_with_digital_line(order, digital_content, stock, site_settings):
-    site_settings.automatic_fulfillment_digital_products = True
-    site_settings.save()
-
-    variant = stock.product_variant
-    variant.digital_content = digital_content
-    variant.digital_content.save()
-
-    product_type = variant.product.product_type
-    product_type.is_shipping_required = False
-    product_type.is_digital = True
-    product_type.save()
+def order_without_shipping_required(order, product_without_shipping):
+    variant = product_without_shipping.variants.get()
+    stock = variant.stocks.get()
 
     quantity = 3
     product = variant.product
@@ -1051,6 +1104,8 @@ def order_with_digital_line(order, digital_content, stock, site_settings):
         total_price=unit_price * quantity,
         tax_rate=Decimal("0.23"),
     )
+    order.lines_count = order.lines.count()
+    order.save(update_fields=["lines_count"])
 
     Allocation.objects.create(order_line=line, stock=stock, quantity_allocated=quantity)
 
@@ -1064,9 +1119,9 @@ def preorders(orders, product):
         ProductVariant(
             product=product,
             is_preorder=True,
-            sku=f"Preorder product variant #{i}",
+            sku=f"Preorder product variant #{i + 1}",
         )
-        for i in (1, 2, 3, 4)
+        for i in range(4)
     ]
     variants[1].preorder_end_date = timezone.now() + timedelta(days=1)
     variants[2].preorder_end_date = timezone.now()

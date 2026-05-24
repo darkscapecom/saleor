@@ -1,6 +1,9 @@
-from saleor.graphql.tests.utils import get_graphql_content
+from ...account.utils.fragments import ADDRESS_FRAGMENT
+from ...utils import get_graphql_content
+from .fragments import ORDER_LINE_FRAGMENT
 
-ORDER_QUERY = """
+ORDER_QUERY = (
+    """
 query OrderDetails($id: ID!) {
   order(id: $id) {
     availableShippingMethods {
@@ -8,6 +11,8 @@ query OrderDetails($id: ID!) {
       active
     }
     paymentStatus
+    authorizeStatus
+    chargeStatus
     isPaid
     payments {
       id
@@ -39,22 +44,21 @@ query OrderDetails($id: ID!) {
       id
     }
     shippingAddress {
-      country {
-        code
-      }
-      countryArea
-      firstName
-      cityArea
-      city
-      phone
-      postalCode
-      streetAddress1
-      streetAddress2
+      ...Address
+    }
+    billingAddress {
+      ...Address
     }
     statusDisplay
     status
     transactions {
       id
+      chargedAmount {
+        amount
+      }
+      authorizedAmount {
+        amount
+      }
     }
     metadata {
       key
@@ -64,9 +68,39 @@ query OrderDetails($id: ID!) {
       key
       value
     }
+    lines {
+      ...OrderLine
+    }
+    subtotal{
+      gross {
+          amount
+      }
+      net {
+          amount
+      }
+    }
+    total{
+      gross {
+          amount
+      }
+      net {
+          amount
+      }
+    }
+    undiscountedTotal{
+      gross {
+          amount
+      }
+      net {
+          amount
+      }
+    }
   }
 }
 """
+    + ADDRESS_FRAGMENT
+    + ORDER_LINE_FRAGMENT
+)
 
 
 def order_query(

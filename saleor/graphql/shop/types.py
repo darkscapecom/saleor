@@ -9,6 +9,7 @@ from ...app.utils import get_active_tax_apps
 from ...channel import models as channel_models
 from ...core.models import ModelWithMetadata
 from ...core.utils import build_absolute_uri, get_domain, is_ssl_enabled
+from ...payment.gateway import get_payment_gateways
 from ...permission.auth_filters import AuthorizationFilters
 from ...permission.enums import AppPermission, SitePermissions, get_permissions
 from ...site import models as site_models
@@ -18,7 +19,9 @@ from ..core import ResolveInfo
 from ..core.context import get_database_connection_name
 from ..core.descriptions import (
     ADDED_IN_319,
-    DEPRECATED_IN_3X_FIELD,
+    ADDED_IN_322,
+    ADDED_IN_323,
+    DEFAULT_DEPRECATION_REASON,
     DEPRECATED_IN_3X_INPUT,
 )
 from ..core.doc_category import (
@@ -40,6 +43,7 @@ from ..core.types import (
 )
 from ..core.utils import str_to_enum
 from ..meta.types import ObjectWithMetadata
+from ..page.types import PageType
 from ..payment.types import PaymentGateway
 from ..plugins.dataloaders import plugin_manager_promise_callback
 from ..shipping.types import ShippingMethod
@@ -48,7 +52,7 @@ from ..translations.fields import TranslationField
 from ..translations.resolvers import resolve_translation
 from ..translations.types import ShopTranslation
 from ..utils import format_permissions_for_display
-from .enums import GiftCardSettingsExpiryTypeEnum
+from .enums import GiftCardSettingsExpiryTypeEnum, PasswordLoginModeEnum
 from .filters import CountryFilterInput
 from .resolvers import resolve_available_shipping_methods, resolve_countries
 
@@ -79,6 +83,21 @@ class OrderSettings(ModelObjectType[site_models.SiteSettings]):
         model = site_models.SiteSettings
 
 
+class RefundSettings(ModelObjectType[site_models.SiteSettings]):
+    reason_reference_type = graphene.Field(
+        PageType, description="Model type used for refund reasons."
+    )
+
+    class Meta:
+        description = "Refund related settings from site settings." + ADDED_IN_322
+        doc_category = DOC_CATEGORY_ORDERS
+        model = site_models.SiteSettings
+
+    @staticmethod
+    def resolve_reason_reference_type(root, info):
+        return root.refund_reason_reference_type
+
+
 class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
     expiry_type = GiftCardSettingsExpiryTypeEnum(
         description="The gift card expiry type settings.", required=True
@@ -92,9 +111,11 @@ class GiftCardSettings(ModelObjectType[site_models.SiteSettings]):
         doc_category = DOC_CATEGORY_GIFT_CARDS
         model = site_models.SiteSettings
 
+    @staticmethod
     def resolve_expiry_type(root, info):
         return root.gift_card_expiry_type
 
+    @staticmethod
     def resolve_expiry_period(root, info):
         if root.gift_card_expiry_period_type is None:
             return None
@@ -250,11 +271,6 @@ class Shop(graphene.ObjectType):
     )
     default_weight_unit = WeightUnitsEnum(description="Default weight unit.")
     translation = TranslationField(ShopTranslation, type_name="shop", resolver=None)
-    automatic_fulfillment_digital_products = PermissionsField(
-        graphene.Boolean,
-        description="Enable automatic fulfillment for all digital products.",
-        permissions=[SitePermissions.MANAGE_SETTINGS],
-    )
     reserve_stock_duration_anonymous_user = PermissionsField(
         graphene.Int,
         description=(
@@ -277,16 +293,6 @@ class Shop(graphene.ObjectType):
             "Default number of maximum line quantity in single checkout "
             "(per single checkout line)."
         ),
-        permissions=[SitePermissions.MANAGE_SETTINGS],
-    )
-    default_digital_max_downloads = PermissionsField(
-        graphene.Int,
-        description="Default number of max downloads per digital content URL.",
-        permissions=[SitePermissions.MANAGE_SETTINGS],
-    )
-    default_digital_url_valid_days = PermissionsField(
-        graphene.Int,
-        description="Default number of days which digital content URL will be valid.",
         permissions=[SitePermissions.MANAGE_SETTINGS],
     )
     company_address = graphene.Field(
@@ -319,7 +325,7 @@ class Shop(graphene.ObjectType):
         LimitInfo,
         required=True,
         description="Resource limitations and current usage if any set for a shop",
-        deprecation_reason=(f"{DEPRECATED_IN_3X_FIELD}"),
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
         permissions=[AuthorizationFilters.AUTHENTICATED_STAFF_USER],
     )
     version = PermissionsField(
@@ -350,32 +356,63 @@ class Shop(graphene.ObjectType):
         ],
     )
 
+    preserve_all_address_fields = PermissionsField(
+        graphene.Boolean,
+        description=(
+            "When enabled, address fields that are not valid for a given country "
+            "(according to Google's i18n address data) will be preserved instead of "
+            "being removed during validation. Validation errors are still returned."
+        )
+        + ADDED_IN_322,
+        permissions=[SitePermissions.MANAGE_SETTINGS],
+        required=True,
+    )
+    password_login_mode = PermissionsField(
+        PasswordLoginModeEnum,
+        description="Controls whether password-based authentication is allowed."
+        + ADDED_IN_323,
+        required=True,
+    )
+
     # deprecated
     include_taxes_in_prices = graphene.Boolean(
         description="Include taxes in prices.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use "
-            "`Channel.taxConfiguration.pricesEnteredWithTax` to determine whether "
-            "prices are entered with tax."
-        ),
+        deprecation_reason="Use `Channel.taxConfiguration.pricesEnteredWithTax` to determine whether prices are entered with tax.",
         required=True,
     )
     display_gross_prices = graphene.Boolean(
         description="Display prices with tax in store.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `Channel.taxConfiguration` to determine "
-            "whether to display gross or net prices."
-        ),
+        deprecation_reason="Use `Channel.taxConfiguration` to determine whether to display gross or net prices.",
         required=True,
     )
     charge_taxes_on_shipping = graphene.Boolean(
         description="Charge taxes on shipping.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `ShippingMethodType.taxClass` to determine "
-            "whether taxes are calculated for shipping methods; if a tax class is set, "
-            "the taxes will be calculated, otherwise no tax rate will be applied."
+        deprecation_reason="Use `ShippingMethodType.taxClass` to determine "
+        "whether taxes are calculated for shipping methods; if a tax class is set, "
+        "the taxes will be calculated, otherwise no tax rate will be applied.",
+        required=True,
+    )
+    use_legacy_shipping_zone_stock_availability = graphene.Boolean(
+        description=(
+            "When enabled, stock availability is filtered by shipping zones "
+            "and the destination address (legacy behavior). "
+            "When disabled, stock availability is determined only by the direct "
+            "warehouse-channel link, ignoring shipping zones." + ADDED_IN_323
         ),
         required=True,
+    )
+
+    # legacy settings
+    use_legacy_update_webhook_emission = graphene.Boolean(
+        description=(
+            "Use legacy update webhook emission. "
+            "When enabled, update webhooks (e.g. `customerUpdated`,"
+            "`productVariantUpdated`) are sent even when only metadata changes. "
+            "When disabled, update webhooks are not sent for metadata-only changes; "
+            "only metadata-specific webhooks (e.g., `customerMetadataUpdated`, "
+            "`productVariantMetadataUpdated`) are sent." + ADDED_IN_322
+        ),
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
 
     class Meta:
@@ -406,7 +443,11 @@ class Shop(graphene.ObjectType):
     def resolve_available_payment_gateways(
         _, _info, manager, currency: str | None = None, channel: str | None = None
     ):
-        return manager.list_payment_gateways(currency=currency, channel_slug=channel)
+        return get_payment_gateways(
+            manager=manager,
+            currency=currency,
+            channel_slug=channel,
+        )
 
     @staticmethod
     @traced_resolver
@@ -541,11 +582,6 @@ class Shop(graphene.ObjectType):
 
     @staticmethod
     @load_site_callback
-    def resolve_automatic_fulfillment_digital_products(_, _info, site):
-        return site.settings.automatic_fulfillment_digital_products
-
-    @staticmethod
-    @load_site_callback
     def resolve_reserve_stock_duration_anonymous_user(_, _info, site):
         return site.settings.reserve_stock_duration_anonymous_user
 
@@ -558,16 +594,6 @@ class Shop(graphene.ObjectType):
     @load_site_callback
     def resolve_limit_quantity_per_checkout(_, _info, site):
         return site.settings.limit_quantity_per_checkout
-
-    @staticmethod
-    @load_site_callback
-    def resolve_default_digital_max_downloads(_, _info, site):
-        return site.settings.default_digital_max_downloads
-
-    @staticmethod
-    @load_site_callback
-    def resolve_default_digital_url_valid_days(_, _info, site):
-        return site.settings.default_digital_url_valid_days
 
     @staticmethod
     def resolve_staff_notification_recipients(_, info):
@@ -646,3 +672,23 @@ class Shop(graphene.ObjectType):
         return ObjectWithMetadata.resolve_private_metafields(
             site.settings, info, keys=keys
         )
+
+    @staticmethod
+    @load_site_callback
+    def resolve_preserve_all_address_fields(_, _info, site):
+        return site.settings.preserve_all_address_fields
+
+    @staticmethod
+    @load_site_callback
+    def resolve_password_login_mode(_, _info, site):
+        return site.settings.password_login_mode
+
+    @staticmethod
+    @load_site_callback
+    def resolve_use_legacy_shipping_zone_stock_availability(_, _info, site):
+        return site.settings.use_legacy_shipping_zone_stock_availability
+
+    @staticmethod
+    @load_site_callback
+    def resolve_use_legacy_update_webhook_emission(_, _info, site):
+        return site.settings.use_legacy_update_webhook_emission

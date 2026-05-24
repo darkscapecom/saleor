@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+from unittest.mock import patch
 
 import graphene
 
@@ -160,7 +161,7 @@ def test_query_promotion_with_complex_rule_2(
         description=dummy_editorjs("Test description for percentage promotion rule."),
         catalogue_predicate=catalogue_predicate,
         reward_value_type=RewardValueType.PERCENTAGE,
-        reward_value=Decimal("10"),
+        reward_value=Decimal(10),
     )
 
     variables = {"id": graphene.Node.to_global_id("Promotion", promotion.id)}
@@ -209,6 +210,52 @@ def test_query_order_promotion_with_gift_rule(
     assert set(rule["giftIds"]) == {
         graphene.Node.to_global_id("ProductVariant", gift.pk)
         for gift in rule_db.gifts.all()
+    }
+    assert rule["giftsLimit"] == 1
+    assert rule["rewardType"] == RewardType.GIFT.upper()
+
+
+@patch(
+    "saleor.graphql.discount.types.promotions.GiftsByPromotionRuleIDLoader.batch_load"
+)
+def test_query_order_promotion_with_gift_rule_variant_removed_in_meantime(
+    mock_batch_load,
+    order_promotion_without_rules,
+    gift_promotion_rule,
+    staff_api_client,
+    permission_group_manage_discounts,
+):
+    # given
+    query = """
+        query Promotion($id: ID!) {
+            promotion(id: $id) {
+                id
+                rules {
+                    rewardType
+                    giftIds
+                    giftsLimit
+                }
+            }
+        }
+    """
+    promotion = order_promotion_without_rules
+    permission_group_manage_discounts.user_set.add(staff_api_client.user)
+    promotion_id = graphene.Node.to_global_id("Promotion", promotion.id)
+    promotion.rules.add(gift_promotion_rule)
+
+    variables = {"id": promotion_id}
+
+    returned_gift = gift_promotion_rule.gifts.first()
+    mock_batch_load.return_value = [[None, returned_gift]]
+
+    # when
+    response = staff_api_client.post_graphql(query, variables)
+
+    # then
+    content = get_graphql_content(response)
+    rule = content["data"]["promotion"]["rules"][0]
+    assert set(rule["giftIds"]) == {
+        graphene.Node.to_global_id("ProductVariant", returned_gift.pk)
     }
     assert rule["giftsLimit"] == 1
     assert rule["rewardType"] == RewardType.GIFT.upper()
@@ -295,7 +342,7 @@ def test_query_promotion_rule_translation(
         ):
             assert rule["translation"]["name"] == promotion_rule_translation_fr.name
             assert rule["translation"]["description"] == json.dumps(
-                promotion_rule_translation_fr.description
+                promotion_rule_translation_fr.description, sort_keys=True
             )
             assert rule["translation"]["language"]["code"] == "FR"
         else:
@@ -360,3 +407,32 @@ def test_query_promotion_events(
             event_data["ruleId"] = db_event.parameters.get("rule_id")
 
         assert event_data in events
+
+
+def test_query_promotion_event_created_by_hidden_for_app_with_only_manage_staff(
+    promotion_events,
+    app_api_client,
+    permission_manage_discounts,
+    permission_manage_staff,
+):
+    # given
+    # MANAGE_STAFF must NOT, on its own, expose a PromotionEvent's createdBy
+    # user to an app caller. The resolver returns None when the requestor is
+    # not the owner and lacks an effective MANAGE_STAFF scope (apps cannot
+    # use MANAGE_STAFF as a general-purpose pass-through).
+    promotion = promotion_events[0].promotion
+    promotion_id = graphene.Node.to_global_id("Promotion", promotion.id)
+    variables = {"id": promotion_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        QUERY_PROMOTION_BY_ID_WITH_EVENTS,
+        variables,
+        permissions=(permission_manage_discounts, permission_manage_staff),
+    )
+
+    # then
+    content = get_graphql_content(response)
+    events = content["data"]["promotion"]["events"]
+    assert len(events) == promotion.events.count()
+    assert all(event["createdBy"] is None for event in events)

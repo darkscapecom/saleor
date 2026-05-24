@@ -8,13 +8,13 @@ from ....core import JobStatus
 from ....permission.enums import AppPermission
 from ....webhook.event_types import WebhookEventAsyncType
 from ...core import ResolveInfo
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import AppError
 from ...core.utils import WebhookEventInfo
 from ..types import AppInstallation
 
 
-class AppRetryInstall(ModelMutation):
+class AppRetryInstall(DeprecatedModelMutation):
     class Arguments:
         id = graphene.ID(description="ID of failed installation.", required=True)
         activate_after_installation = graphene.Boolean(
@@ -38,7 +38,9 @@ class AppRetryInstall(ModelMutation):
         ]
 
     @classmethod
-    def save(cls, _info: ResolveInfo, instance, _cleaned_input, /):
+    def save(
+        cls, _info: ResolveInfo, instance, _cleaned_input, /, instance_tracker=None
+    ):
         instance.status = JobStatus.PENDING
         instance.save()
 

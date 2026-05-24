@@ -2,6 +2,7 @@ import graphene
 from django.core.exceptions import ValidationError
 from graphql.error.base import GraphQLError
 
+from ....attribute import models as attribute_models
 from ....checkout import models as checkout_models
 from ....core import models
 from ....core.db.connection import allow_writer
@@ -11,16 +12,14 @@ from ....discount import models as discount_models
 from ....discount.models import Promotion
 from ....menu import models as menu_models
 from ....order import models as order_models
+from ....page import models as page_models
 from ....product import models as product_models
 from ....shipping import models as shipping_models
-from ...channel import ChannelContext
 from ...core import ResolveInfo
-from ...core.context import BaseContext, SyncWebhookControlContext
+from ...core.context import BaseContext, ChannelContext, SyncWebhookControlContext
 from ...core.mutations import BaseMutation
 from ...core.utils import from_global_id_or_error
-from ...payment.utils import metadata_contains_empty_key
 from ..extra_methods import TYPE_EXTRA_METHODS
-from ..permissions import AccountPermissions
 from ..types import ObjectWithMetadata
 from .utils import get_valid_metadata_instance
 
@@ -34,7 +33,7 @@ class BaseMetadataMutation(BaseMutation):
         abstract = True
 
     @classmethod
-    def __init_subclass_with_meta__(
+    def __init_subclass_with_meta__(  # type: ignore[override]
         cls,
         arguments=None,
         permission_map=None,
@@ -121,18 +120,6 @@ class BaseMetadataMutation(BaseMutation):
             )
 
     @classmethod
-    def validate_metadata_keys(cls, metadata_list: list[dict]):
-        if metadata_contains_empty_key(metadata_list):
-            raise ValidationError(
-                {
-                    "input": ValidationError(
-                        "Metadata key cannot be empty.",
-                        code=MetadataErrorCode.REQUIRED.value,
-                    )
-                }
-            )
-
-    @classmethod
     def get_permissions(cls, info: ResolveInfo, type_name, object_pk, **data):
         if object_pk is None:
             return []
@@ -163,15 +150,6 @@ class BaseMetadataMutation(BaseMutation):
             return graphene_type.get_model()
 
         return graphene_type._meta.model
-
-    @classmethod
-    def check_permissions(cls, context, permissions=None, **data):
-        is_app = bool(getattr(context, "app", None))
-        if is_app and permissions and AccountPermissions.MANAGE_STAFF in permissions:
-            raise PermissionDenied(
-                message="Apps are not allowed to perform this mutation."
-            )
-        return super().check_permissions(context, permissions)
 
     @classmethod
     @allow_writer()
@@ -222,6 +200,10 @@ class BaseMetadataMutation(BaseMutation):
                 )
 
             if not result.errors and has_changed:
+                # Update fields for other models are performed in mutations together
+                # with metadata update to perform one DB query.
+                if isinstance(instance, checkout_models.Checkout):
+                    instance.save(update_fields=["last_change"])
                 cls.perform_model_extra_actions(root, info, type_name, **data)
 
         except ValidationError as e:
@@ -270,8 +252,12 @@ class BaseMetadataMutation(BaseMutation):
             | product_models.Product
             | product_models.ProductVariant
             | shipping_models.ShippingMethod
-            | shipping_models.ShippingZone,
+            | shipping_models.ShippingZone
+            | attribute_models.Attribute
+            | attribute_models.AttributeValue
+            | page_models.Page,
         )
+
         use_channel_context = use_channel_context or (
             # For old sales migrated into promotions
             isinstance(instance, Promotion) and instance.old_sale_id

@@ -7,7 +7,7 @@ from ....permission.enums import AppPermission, get_permissions
 from ....webhook.event_types import WebhookEventAsyncType
 from ...core.doc_category import DOC_CATEGORY_APPS
 from ...core.enums import PermissionEnum
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import AppError, BaseInputObjectType, NonNullList
 from ...core.utils import WebhookEventInfo
 from ...decorators import staff_member_required
@@ -17,8 +17,10 @@ from ..utils import ensure_can_manage_permissions
 
 
 class AppInstallInput(BaseInputObjectType):
-    app_name = graphene.String(description="Name of the app to install.")
-    manifest_url = graphene.String(description="URL to app's manifest in JSON format.")
+    app_name = graphene.String(description="Name of the app to install.", required=True)
+    manifest_url = graphene.String(
+        description="URL to app's manifest in JSON format.", required=True
+    )
     activate_after_installation = graphene.Boolean(
         default_value=True,
         required=False,
@@ -39,7 +41,7 @@ class AppInstallInput(BaseInputObjectType):
         ]
 
 
-class AppInstall(ModelMutation):
+class AppInstall(DeprecatedModelMutation):
     class Arguments:
         input = AppInstallInput(
             required=True,
@@ -65,9 +67,9 @@ class AppInstall(ModelMutation):
         cleaned_input = super().clean_input(info, instance, data, **kwargs)
 
         # clean and prepare permissions
-        if "permissions" in cleaned_input:
+        permissions = cleaned_input.pop("permissions", None)
+        if permissions:
             requestor = get_user_or_app_from_context(info.context)
-            permissions = cleaned_input.pop("permissions")
             cleaned_input["permissions"] = get_permissions(permissions)
             ensure_can_manage_permissions(requestor, permissions)
         return cleaned_input

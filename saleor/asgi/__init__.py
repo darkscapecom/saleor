@@ -9,11 +9,15 @@ https://docs.djangoproject.com/en/3.1/howto/deployment/asgi/
 import gc
 import os
 
-from django.core.asgi import get_asgi_application
+from django.conf import settings
 
+from ..core.telemetry import initialize_telemetry
+from .asgi_handler import get_asgi_application
 from .cors_handler import cors_handler
 from .gzip_compression import gzip_compression
 from .health_check import health_check
+from .telemetry import telemetry_middleware
+from .usage_telemetry import usage_telemetry_middleware
 
 
 def preload_app() -> None:
@@ -24,6 +28,7 @@ def preload_app() -> None:
     from django.conf import settings
     from django.urls import get_resolver
 
+    initialize_telemetry()
     getattr(get_resolver(settings.ROOT_URLCONF), "url_patterns")
     gc.collect()
     gc.freeze()  # mark anything that remains as uncollectable to speed up future collections
@@ -32,8 +37,11 @@ def preload_app() -> None:
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "saleor.settings")
 
 application = get_asgi_application()
-application = health_check(application, "/health/")  # type: ignore[arg-type] # Django's ASGI app is less strict than the spec # noqa: E501
+application = health_check(application, "/health/")
 application = gzip_compression(application)
 application = cors_handler(application)
+application = telemetry_middleware(application)
+if settings.SEND_USAGE_TELEMETRY is True:
+    application = usage_telemetry_middleware(application)
 
 preload_app()

@@ -13,9 +13,10 @@ from ..payment import models as payment_models
 from ..payment.error_codes import PaymentErrorCode
 from ..plugins.manager import PluginsManager
 from . import models
+from .delivery_context import clear_cc_delivery_method, is_shipping_required
 from .error_codes import CheckoutErrorCode, OrderCreateFromCheckoutErrorCode
 from .models import Checkout
-from .utils import clear_delivery_method, is_fully_paid, is_shipping_required
+from .utils import is_fully_paid
 
 if TYPE_CHECKING:
     from .fetch import CheckoutInfo, CheckoutLineInfo
@@ -52,7 +53,8 @@ def clean_checkout_shipping(
                 }
             )
         if not delivery_method_info.is_method_in_valid_methods(checkout_info):
-            clear_delivery_method(checkout_info)
+            if checkout_info.checkout.collection_point_id:
+                clear_cc_delivery_method(checkout_info)
             raise ValidationError(
                 {
                     "shipping_method": ValidationError(

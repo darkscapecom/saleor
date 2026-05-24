@@ -12,6 +12,7 @@ from ...discount.models import (
     CheckoutDiscount,
     CheckoutLineDiscount,
     OrderDiscount,
+    OrderLineDiscount,
     Promotion,
     PromotionEvent,
     PromotionRule,
@@ -20,7 +21,7 @@ from ...discount.models import (
     VoucherCode,
 )
 from ...product.models import ProductVariant
-from ..channel.dataloaders import ChannelBySlugLoader
+from ..channel.dataloaders.by_self import ChannelBySlugLoader
 from ..core.dataloaders import DataLoader
 
 if TYPE_CHECKING:
@@ -238,7 +239,20 @@ class OrderDiscountsByOrderIDLoader(DataLoader[UUID, list[OrderDiscount]]):
         discount_map = defaultdict(list)
         for discount in discounts:
             discount_map[discount.order_id].append(discount)
-        return [discount_map.get(order_id, []) for order_id in keys]
+        return [discount_map[order_id] for order_id in keys]
+
+
+class OrderLineDiscountsByOrderLineIDLoader(DataLoader[UUID, list[OrderDiscount]]):
+    context_key = "orderlinediscounts_by_orderline_id"
+
+    def batch_load(self, keys):
+        discounts = OrderLineDiscount.objects.using(
+            self.database_connection_name
+        ).filter(line_id__in=keys)
+        discount_map = defaultdict(list)
+        for discount in discounts:
+            discount_map[discount.line_id].append(discount)
+        return [discount_map[line_id] for line_id in keys]
 
 
 class CheckoutLineDiscountsByCheckoutLineIdLoader(

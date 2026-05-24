@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING, Optional, TypedDict
 from uuid import UUID
 
 import graphene
-from django.conf import settings
 from django.contrib.sites.models import Site
 from django.db import transaction
+from django.db.models import F
 
 from ..account.models import User
 from ..app.models import App
@@ -17,44 +17,35 @@ from ..core.tracing import traced_atomic_transaction
 from ..core.transactions import transaction_with_commit_on_errors
 from ..core.utils.events import (
     call_event,
-    call_event_including_protected_events,
-    webhook_async_event_requires_sync_webhooks_to_trigger,
 )
 from ..giftcard import GiftCardLineData
-from ..order.utils import order_lines_qs_select_for_update
+from ..order.lock_objects import order_lines_qs_select_for_update
 from ..payment import (
     ChargeStatus,
     CustomPaymentChoices,
     PaymentError,
     TransactionAction,
     TransactionKind,
-    gateway,
 )
 from ..payment.interface import RefundData
 from ..payment.models import Payment, Transaction, TransactionItem
-from ..payment.utils import create_payment, create_transaction_for_order
 from ..plugins.manager import PluginsManager
-from ..shipping.models import ShippingMethodChannelListing
 from ..warehouse.management import (
     deallocate_stock,
-    deallocate_stock_for_order,
+    deallocate_stock_for_orders,
     decrease_stock,
-    get_order_lines_with_track_inventory,
 )
 from ..warehouse.models import Stock
-from ..webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
+from ..webhook.event_types import WebhookEventAsyncType
 from ..webhook.utils import get_webhooks_for_multiple_events
 from . import (
-    ORDER_EDITABLE_STATUS,
     FulfillmentLineData,
     FulfillmentStatus,
     OrderChargeStatus,
     OrderOrigin,
     OrderStatus,
     events,
-    utils,
 )
-from .calculations import fetch_order_prices_if_expired
 from .events import (
     draft_order_created_from_replace_event,
     fulfillment_refunded_event,
@@ -73,8 +64,6 @@ from .notifications import (
 )
 from .utils import (
     clean_order_line_quantities,
-    get_valid_shipping_methods_for_order,
-    order_line_needs_automatic_fulfillment,
     restock_fulfillment_lines,
     update_order_authorize_data,
     update_order_charge_data,
@@ -105,28 +94,23 @@ class OrderFulfillmentLineInfo(TypedDict):
 WEBHOOK_EVENTS_FOR_ORDER_FULFILLED = {
     WebhookEventAsyncType.ORDER_FULFILLED,
     WebhookEventAsyncType.ORDER_UPDATED,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 
 WEBHOOK_EVENTS_FOR_ORDER_REFUNDED = {
     WebhookEventAsyncType.ORDER_FULLY_REFUNDED,
     WebhookEventAsyncType.ORDER_REFUNDED,
     WebhookEventAsyncType.ORDER_UPDATED,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 WEBHOOK_EVENTS_FOR_ORDER_CANCELED = {
     WebhookEventAsyncType.ORDER_CANCELLED,
     WebhookEventAsyncType.ORDER_UPDATED,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 WEBHOOK_EVENTS_FOR_FULLY_PAID = {
     WebhookEventAsyncType.ORDER_UPDATED,
     WebhookEventAsyncType.ORDER_FULLY_PAID,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 WEBHOOK_EVENTS_FOR_ORDER_AUTHORIZED = {
     WebhookEventAsyncType.ORDER_UPDATED,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 
 WEBHOOK_EVENTS_FOR_ORDER_CHARGED = {
@@ -135,7 +119,6 @@ WEBHOOK_EVENTS_FOR_ORDER_CHARGED = {
 
 WEBHOOK_EVENTS_FOR_ORDER_CONFIRMED = {
     WebhookEventAsyncType.ORDER_CONFIRMED,
-    *WebhookEventSyncType.ORDER_EVENTS,
 }
 
 
@@ -161,38 +144,107 @@ ORDER_WEBHOOK_EVENT_MAP = {
 }
 
 
-def _trigger_order_sync_webhooks(
-    manager: "PluginsManager",
-    order: "Order",
-    webhook_event_map: dict[str, set["Webhook"]],
-    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
-):
-    if (
-        webhook_event_map.get(WebhookEventSyncType.ORDER_CALCULATE_TAXES)
-        and order.should_refresh_prices
+def _get_extra_for_order_logger(order: "Order") -> dict:
+    return {
+        "order_id": order.id,
+        "currency": order.currency,
+        "status": order.status,
+        "origin": order.origin,
+        "checkout_id": order.checkout_token,
+        "undiscounted_base_shipping_price_amount": order.undiscounted_base_shipping_price_amount,
+        "base_shipping_price_amount": order.base_shipping_price_amount,
+        "shipping_price_net_amount": order.shipping_price_net_amount,
+        "shipping_price_gross_amount": order.shipping_price_gross_amount,
+        "undiscounted_total_net_amount": order.undiscounted_total_net_amount,
+        "total_net_amount": order.total_net_amount,
+        "undiscounted_total_gross_amount": order.undiscounted_total_gross_amount,
+        "total_gross_amount": order.total_gross_amount,
+        "subtotal_net_amount": order.subtotal_net_amount,
+        "subtotal_gross_amount": order.subtotal_gross_amount,
+        "has_voucher_code": bool(order.voucher_code),
+        "tax_exemption": order.tax_exemption,
+        "tax_error": order.tax_error,
+    }
+
+
+def _get_extra_for_order_line_logger(line: "OrderLine") -> dict:
+    return {
+        "line_id": line.id,
+        "variant_id": line.variant_id,
+        "quantity": line.quantity,
+        "is_gift_card": line.is_gift_card,
+        "is_price_overridden": line.is_price_overridden,
+        "unit_price_net_amount": line.unit_price_net_amount,
+        "unit_price_gross_amount": line.unit_price_gross_amount,
+        "total_price_net_amount": line.total_price_net_amount,
+        "total_price_gross_amount": line.total_price_gross_amount,
+        "has_voucher_code": line.voucher_code,
+        "unit_discount_amount": line.unit_discount_amount,
+        "unit_discount_type": line.unit_discount_type,
+        "unit_discount_reason": line.unit_discount_reason,
+    }
+
+
+def _order_has_negative_prices(order: "Order", lines: list["OrderLineInfo"]) -> bool:
+    if not order:
+        logger.error("Received None as order to check for negative prices")
+        return False
+
+    if list(
+        filter(
+            lambda x: x < 0,
+            [
+                order.shipping_price_net_amount,
+                order.shipping_price_gross_amount,
+                order.total_net_amount,
+                order.total_gross_amount,
+                order.subtotal_net_amount,
+                order.subtotal_gross_amount,
+            ],
+        )
     ):
-        fetch_order_prices_if_expired(
-            order,
-            manager,
-            database_connection_name=database_connection_name,
+        return True
+    if lines is None:
+        logger.error(
+            "Received None as order lines to check for negative prices",
+            extra=_get_extra_for_order_logger(order),
         )
-    if webhook_event_map.get(WebhookEventSyncType.ORDER_FILTER_SHIPPING_METHODS):
-        shipping_listings = ShippingMethodChannelListing.objects.filter(
-            channel_id=order.channel_id
-        )
-        get_valid_shipping_methods_for_order(
-            order,
-            shipping_listings,
-            manager,
-            database_connection_name=database_connection_name,
-        )
+        return False
+    for line_info in lines:
+        line = line_info.line
+        if not line:
+            logger.error(
+                "Received None as order line to check for negative prices",
+                extra=_get_extra_for_order_logger(order),
+            )
+            continue
+        if list(
+            filter(
+                lambda x: x < 0,
+                [
+                    line.unit_price_net_amount,
+                    line.unit_price_gross_amount,
+                    line.total_price_net_amount,
+                    line.total_price_gross_amount,
+                ],
+            )
+        ):
+            return True
+    return False
+
+
+def _log_order_with_negative_price(order: "Order", lines: list["OrderLineInfo"]):
+    extra = _get_extra_for_order_logger(order)
+    extra["lines"] = [
+        _get_extra_for_order_line_logger(line_info.line) for line_info in lines
+    ]
+    logger.error("Order with negative prices detected", extra=extra)
 
 
 def call_order_events(
     manager: "PluginsManager",
     event_names: list[str],
     order: "Order",
-    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
     webhook_event_map: dict[str, set["Webhook"]] | None = None,
 ):
     missing_events = set(event_names).difference(ORDER_WEBHOOK_EVENT_MAP.keys())
@@ -202,44 +254,19 @@ def call_order_events(
         )
 
     if webhook_event_map is None:
-        webhook_event_map = get_webhooks_for_multiple_events(
-            [*event_names, *WebhookEventSyncType.ORDER_EVENTS]
-        )
-
-    any_event_requires_sync_webhooks = any(
-        webhook_async_event_requires_sync_webhooks_to_trigger(
-            event_name,
-            webhook_event_map,
-            possible_sync_events=WebhookEventSyncType.ORDER_EVENTS,
-        )
-        for event_name in event_names
-    )
-
-    should_trigger_sync = (
-        any_event_requires_sync_webhooks
-        and order.status in ORDER_EDITABLE_STATUS
-        and WebhookEventAsyncType.DRAFT_ORDER_DELETED not in event_names
-    )
-    if should_trigger_sync:
-        _trigger_order_sync_webhooks(
-            manager,
-            order,
-            database_connection_name=database_connection_name,
-            webhook_event_map=webhook_event_map,
-        )
+        webhook_event_map = get_webhooks_for_multiple_events(event_names)
 
     for event_name in event_names:
         plugin_manager_method_name = ORDER_WEBHOOK_EVENT_MAP[event_name]
         webhooks = webhook_event_map.get(event_name, set())
         event_func = getattr(manager, plugin_manager_method_name)
-        call_event_including_protected_events(event_func, order, webhooks=webhooks)
+        call_event(event_func, order, webhooks=webhooks)
 
 
 def call_order_event(
     manager: "PluginsManager",
     event_name: str,
     order: "Order",
-    database_connection_name: str = settings.DATABASE_CONNECTION_DEFAULT_NAME,
     webhook_event_map: dict[str, set["Webhook"]] | None = None,
 ):
     if event_name not in ORDER_WEBHOOK_EVENT_MAP:
@@ -249,34 +276,11 @@ def call_order_event(
     event_func = getattr(manager, plugin_manager_method_name)
 
     if webhook_event_map is None:
-        webhook_event_map = get_webhooks_for_multiple_events(
-            [event_name, *WebhookEventSyncType.ORDER_EVENTS]
-        )
+        webhook_event_map = get_webhooks_for_multiple_events([event_name])
 
     webhooks = webhook_event_map.get(event_name, set())
 
-    if order.status not in ORDER_EDITABLE_STATUS:
-        call_event_including_protected_events(event_func, order, webhooks=webhooks)
-        return
-    if event_name == WebhookEventAsyncType.DRAFT_ORDER_DELETED:
-        call_event_including_protected_events(event_func, order, webhooks=webhooks)
-        return
-
-    if not webhook_async_event_requires_sync_webhooks_to_trigger(
-        event_name, webhook_event_map, WebhookEventSyncType.ORDER_EVENTS
-    ):
-        call_event_including_protected_events(event_func, order, webhooks=webhooks)
-        return
-
-    _trigger_order_sync_webhooks(
-        manager,
-        order,
-        database_connection_name=database_connection_name,
-        webhook_event_map=webhook_event_map,
-    )
-
-    call_event_including_protected_events(event_func, order, webhooks=webhooks)
-    return
+    call_event(event_func, order, webhooks=webhooks)
 
 
 def order_created(
@@ -297,6 +301,10 @@ def order_created(
             order_id,
             extra={"tax_error": order.tax_error, "order_id": order_id},
         )
+
+    if order_user := order.user:
+        order_user.number_of_orders = F("number_of_orders") + 1
+        order_user.save(update_fields=["number_of_orders"])
 
     events.order_created_event(
         order=order, user=user, app=app, from_draft=from_draft, automatic=automatic
@@ -340,6 +348,9 @@ def order_created(
     if channel.automatically_confirm_all_new_orders:
         order_confirmed(order, user, app, manager, webhook_event_map=webhook_event_map)
 
+    if _order_has_negative_prices(order, order_info.lines_data):
+        _log_order_with_negative_price(order, order_info.lines_data)
+
 
 def order_confirmed(
     order: "Order",
@@ -363,6 +374,10 @@ def order_confirmed(
     if send_confirmation_email:
         send_order_confirmed(order, user, app, manager)
 
+    from ..giftcard.gateway import charge_gift_card_transactions
+
+    charge_gift_card_transactions(order, user=user, app=app)
+
 
 def handle_fully_paid_order(
     manager: "PluginsManager",
@@ -379,8 +394,6 @@ def handle_fully_paid_order(
     events.order_fully_paid_event(order=order, user=user, app=app, gateway=gateway)
     if order_info.customer_email:
         send_payment_confirmation(order_info, manager)
-        if utils.order_needs_automatic_fulfillment(order_info.lines_data):
-            automatically_fulfill_digital_lines(order_info, manager, user, app)
 
     if site_settings is None:
         site_settings = Site.objects.get_current().settings
@@ -410,6 +423,7 @@ def cancel_order(
     user: User | None,
     app: Optional["App"],
     manager: "PluginsManager",
+    site_settings: "SiteSettings",
     webhook_event_map: dict[str, set["Webhook"]] | None = None,
 ):
     """Cancel order.
@@ -419,7 +433,7 @@ def cancel_order(
     # transaction ensures proper allocation and event triggering
     with traced_atomic_transaction():
         events.order_canceled_event(order=order, user=user, app=app)
-        deallocate_stock_for_order(order, manager)
+        deallocate_stock_for_orders([order.id], site_settings, app or user)
         order.status = OrderStatus.CANCELED
         order.save(update_fields=["status", "updated_at"])
         if not webhook_event_map:
@@ -570,8 +584,16 @@ def order_fulfilled(
             auto=auto,
         )
         webhook_events = [WebhookEventAsyncType.ORDER_UPDATED]
+        calculate_stocks_with_shipping_zones = (
+            site_settings.use_legacy_shipping_zone_stock_availability
+        )
         for fulfillment in fulfillments:
-            call_event(manager.fulfillment_created, fulfillment, notify_customer)
+            call_event(
+                manager.fulfillment_created,
+                fulfillment,
+                notify_customer,
+                calculate_stocks_with_shipping_zones,
+            )
 
         order_fulfilled = order.status == OrderStatus.FULFILLED
         if order_fulfilled:
@@ -579,7 +601,12 @@ def order_fulfilled(
 
         if order_fulfilled or manually_approved:
             for fulfillment in fulfillments:
-                call_event(manager.fulfillment_approved, fulfillment, notify_customer)
+                call_event(
+                    manager.fulfillment_approved,
+                    fulfillment,
+                    notify_customer,
+                    calculate_stocks_with_shipping_zones,
+                )
 
         call_order_events(
             manager,
@@ -649,6 +676,12 @@ def order_charged(
         events.payment_captured_event(
             order=order, user=user, app=app, amount=amount, payment=payment
         )
+
+    if order.status == OrderStatus.DRAFT:
+        # Skip charging events for draft orders
+        # They are going to be triggered when order is confirmed
+        return
+
     if webhook_event_map is None:
         webhook_event_map = get_webhooks_for_multiple_events(
             WEBHOOK_EVENTS_FOR_ORDER_CHARGED
@@ -697,7 +730,6 @@ def order_transaction_updated(
     if transaction_item.authorized_value != previous_authorized_value:
         webhook_events = {
             WebhookEventAsyncType.ORDER_UPDATED,
-            *WebhookEventSyncType.ORDER_EVENTS,
         }
         order_updated = True
 
@@ -710,7 +742,6 @@ def order_transaction_updated(
     elif transaction_item.charged_value != previous_charged_value:
         order_updated = True
         webhook_events.add(WebhookEventAsyncType.ORDER_UPDATED)
-        webhook_events = webhook_events.union(WebhookEventSyncType.ORDER_EVENTS)
 
     if transaction_item.refunded_value > previous_refunded_value:
         # order_updated False as order_refunded triggers order_updated
@@ -779,6 +810,8 @@ def cancel_fulfillment(
     app: Optional["App"],
     warehouse: Optional["Warehouse"],
     manager: "PluginsManager",
+    *,
+    calculate_stocks_with_shipping_zones: bool,
 ):
     """Cancel fulfillment.
 
@@ -798,10 +831,17 @@ def cancel_fulfillment(
                 fulfillment=fulfillment,
                 warehouse_pk=warehouse.pk,
             )
+        else:
+            decrease_fulfilled_quantity(fulfillment)
+
         fulfillment.status = FulfillmentStatus.CANCELED
         fulfillment.save(update_fields=["status"])
         update_order_status(fulfillment.order)
-        call_event(manager.fulfillment_canceled, fulfillment)
+        call_event(
+            manager.fulfillment_canceled,
+            fulfillment,
+            calculate_stocks_with_shipping_zones,
+        )
         call_order_event(
             manager,
             WebhookEventAsyncType.ORDER_UPDATED,
@@ -810,36 +850,14 @@ def cancel_fulfillment(
     return fulfillment
 
 
-def cancel_waiting_fulfillment(
-    fulfillment: Fulfillment,
-    user: User,
-    app: Optional["App"],
-    manager: "PluginsManager",
-):
-    """Cancel fulfillment which is in waiting for approval state."""
-    fulfillment = Fulfillment.objects.get(pk=fulfillment.pk)
-    # transaction ensures sending webhooks after order line is updated and events are
-    # successfully created
-    with traced_atomic_transaction():
-        events.fulfillment_canceled_event(
-            order=fulfillment.order, user=user, app=app, fulfillment=None
-        )
-
-        order_lines = []
-        for line in fulfillment:
-            order_line = line.order_line
-            order_line.quantity_fulfilled -= line.quantity
-            order_lines.append(order_line)
-        OrderLine.objects.bulk_update(order_lines, ["quantity_fulfilled"])
-
-        fulfillment.delete()
-        update_order_status(fulfillment.order)
-        call_event(manager.fulfillment_canceled, fulfillment)
-        call_order_event(
-            manager,
-            WebhookEventAsyncType.ORDER_UPDATED,
-            fulfillment.order,
-        )
+def decrease_fulfilled_quantity(fulfillment: Fulfillment) -> None:
+    """Decrease the fulfilled quantity for order lines in the given fulfillment."""
+    order_lines = []
+    for line in fulfillment:
+        order_line = line.order_line
+        order_line.quantity_fulfilled -= line.quantity
+        order_lines.append(order_line)
+    OrderLine.objects.bulk_update(order_lines, ["quantity_fulfilled"])
 
 
 def approve_fulfillment(
@@ -901,7 +919,12 @@ def approve_fulfillment(
         if insufficient_stocks:
             raise InsufficientStock(insufficient_stocks)
 
-        _decrease_stocks(lines_to_fulfill, manager, allow_stock_to_be_exceeded)
+        decrease_stock(
+            lines_to_fulfill,
+            settings,
+            app or user,
+            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+        )
         order.refresh_from_db()
         order_fulfilled(
             [fulfillment],
@@ -930,6 +953,9 @@ def mark_order_as_paid_with_transaction(
     Allows to create a transaction for an order.
     """
     with transaction.atomic():
+        # Circular imports
+        from ..payment.utils import create_transaction_for_order
+
         create_transaction_for_order(
             order=order,
             user=request_user,
@@ -971,6 +997,9 @@ def mark_order_as_paid_with_payment(
     # transaction ensures that webhooks are triggered when payments and transactions are
     # properly created
     with traced_atomic_transaction():
+        # Circular imports
+        from ..payment.utils import create_payment
+
         payment = create_payment(
             gateway=CustomPaymentChoices.MANUAL,
             payment_token="",
@@ -1033,16 +1062,6 @@ def clean_mark_order_as_paid(order: "Order"):
         )
 
 
-def _decrease_stocks(order_lines_info, manager, allow_stock_to_be_exceeded=False):
-    lines_to_decrease_stock = get_order_lines_with_track_inventory(order_lines_info)
-    if lines_to_decrease_stock:
-        decrease_stock(
-            lines_to_decrease_stock,
-            manager,
-            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
-        )
-
-
 def _increase_order_line_quantity(order_lines_info):
     order_lines = []
     for line_info in order_lines_info:
@@ -1055,79 +1074,21 @@ def _increase_order_line_quantity(order_lines_info):
 
 def fulfill_order_lines(
     order_lines_info: list["OrderLineInfo"],
-    manager: "PluginsManager",
+    site_settings: "SiteSettings",
+    requestor: "App | User | None",
     allow_stock_to_be_exceeded: bool = False,
 ):
     """Fulfill order line with given quantity."""
     # transaction ensures that there is a consistency between quantities in order line
     # and stocks
     with traced_atomic_transaction():
-        _decrease_stocks(order_lines_info, manager, allow_stock_to_be_exceeded)
+        decrease_stock(
+            order_lines_info,
+            site_settings,
+            requestor,
+            allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+        )
         _increase_order_line_quantity(order_lines_info)
-
-
-def automatically_fulfill_digital_lines(
-    order_info: "OrderInfo",
-    manager: "PluginsManager",
-    user: User | None = None,
-    app: App | None = None,
-):
-    """Fulfill all digital lines which have enabled automatic fulfillment setting.
-
-    Send confirmation email afterward.
-    """
-    order = order_info.order
-    digital_lines_data = [
-        line_data
-        for line_data in order_info.lines_data
-        if not line_data.line.is_shipping_required and line_data.digital_content
-    ]
-    # transaction ensures fulfillment consistency
-    with traced_atomic_transaction():
-        if not digital_lines_data:
-            return
-        fulfillment, created = Fulfillment.objects.get_or_create(order=order)
-
-        fulfillments = []
-        lines_info = []
-        for line_data in digital_lines_data:
-            if not order_line_needs_automatic_fulfillment(line_data):
-                continue
-            digital_content = line_data.digital_content
-            line = line_data.line
-            if digital_content:
-                digital_content.urls.create(line=line)
-            quantity = line_data.quantity
-            fulfillments.append(
-                FulfillmentLine(
-                    fulfillment=fulfillment, order_line=line, quantity=quantity
-                )
-            )
-            allocation = line.allocations.first()
-            if allocation:
-                line_data.warehouse_pk = allocation.stock.warehouse.pk
-            else:
-                # allocation is not created when track inventory for given product
-                # is turned off so it doesn't matter which warehouse we'll use
-                if line_data.variant:
-                    stock = line_data.variant.stocks.first()
-                    if stock:
-                        line_data.warehouse_pk = stock.warehouse.pk
-
-            lines_info.append(line_data)
-
-        FulfillmentLine.objects.bulk_create(fulfillments)
-        fulfill_order_lines(lines_info, manager)
-        events.fulfillment_fulfilled_items_event(
-            order=order, user=user, app=app, fulfillment_lines=fulfillments, auto=True
-        )
-
-        send_fulfillment_confirmation_to_customer(
-            order, fulfillment, user=order.user, app=None, manager=manager
-        )
-        if created:
-            manager.fulfillment_created(fulfillment)
-        update_order_status(order)
 
 
 def _create_fulfillment_lines(
@@ -1136,8 +1097,11 @@ def _create_fulfillment_lines(
     lines_data: list[OrderFulfillmentLineInfo],
     channel_slug: str,
     gift_card_lines_info: list[GiftCardLineData],
-    manager: "PluginsManager",
-    decrease_stock: bool = True,
+    site_settings: "SiteSettings",
+    requestor: "App | User | None",
+    *,
+    calculate_stocks_with_shipping_zones: bool,
+    should_decrease_stock: bool = True,
     allow_stock_to_be_exceeded: bool = False,
 ) -> list[FulfillmentLine]:
     """Modify stocks and allocations. Return list of unsaved FulfillmentLines.
@@ -1157,10 +1121,14 @@ def _create_fulfillment_lines(
         channel_slug (str): Channel for which fulfillment lines should be created.
         gift_card_lines_info (List): List with information required
             to create gift cards.
-        manager (PluginsManager): Plugin manager from given context
-        decrease_stock (Bool): Stocks will get decreased if this is True.
+        site_settings (SiteSettings): Site settings from given context.
+        requestor (App | User | None): The entity making the request.
+        should_decrease_stock (Bool): Stocks will get decreased if this is True.
         allow_stock_to_be_exceeded (bool): If `True` then stock quantity could exceed.
             Default value is set to `False`.
+        calculate_stocks_with_shipping_zones (bool): If `True`, stock is filtered by
+            shipping zones (legacy behavior). If `False`, all warehouse stocks in the
+            channel are used regardless of shipping zones.
 
     Return:
         List[FulfillmentLine]: Unsaved fulfillment lines created for this fulfillment
@@ -1173,7 +1141,9 @@ def _create_fulfillment_lines(
     lines = [line_data["order_line"] for line_data in lines_data]
     variants = [line.variant for line in lines if line.variant]
     stocks = (
-        Stock.objects.for_channel_and_country(channel_slug)
+        Stock.objects.for_channel_or_country(
+            channel_slug, include_shipping_zones=calculate_stocks_with_shipping_zones
+        )
         .filter(warehouse_id=warehouse_pk, product_variant__in=variants)
         .select_related("product_variant")
     )
@@ -1207,18 +1177,14 @@ def _create_fulfillment_lines(
                 insufficient_stocks.append(error_data)
                 continue
 
-            is_digital = order_line.is_digital
             lines_info.append(
                 OrderLineInfo(
                     line=order_line,
-                    is_digital=is_digital,
                     quantity=quantity,
                     variant=variant,
                     warehouse_pk=warehouse_pk,
                 )
             )
-            if variant and is_digital:
-                variant.digital_content.urls.create(line=order_line)
             fulfillment_line = FulfillmentLine(
                 order_line=order_line,
                 fulfillment=fulfillment,
@@ -1240,8 +1206,14 @@ def _create_fulfillment_lines(
         raise InsufficientStock(insufficient_stocks)
 
     if lines_info:
-        if decrease_stock:
-            _decrease_stocks(lines_info, manager, allow_stock_to_be_exceeded)
+        if should_decrease_stock:
+            decrease_stock(
+                lines_info,
+                site_settings,
+                requestor,
+                allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+            )
+
         _increase_order_line_quantity(lines_info)
 
     return fulfillment_lines
@@ -1338,9 +1310,11 @@ def create_fulfillments(
                     fulfillment_lines_for_warehouses[warehouse_pk],
                     order.channel.slug,
                     gift_card_lines_info,
-                    manager,
-                    decrease_stock=auto_approved,
+                    site_settings,
+                    app or user,
+                    should_decrease_stock=auto_approved,
                     allow_stock_to_be_exceeded=allow_stock_to_be_exceeded,
+                    calculate_stocks_with_shipping_zones=site_settings.use_legacy_shipping_zone_stock_availability,
                 )
             )
             if tracking_number:
@@ -1410,7 +1384,8 @@ def _get_fulfillment_line(
 def _move_order_lines_to_target_fulfillment(
     order_lines_to_move: list[OrderLineInfo],
     target_fulfillment: Fulfillment,
-    manager: "PluginsManager",
+    site_settings: "SiteSettings",
+    requestor: "App | User | None",
 ) -> list[FulfillmentLine]:
     """Move order lines with given quantity to the target fulfillment."""
     fulfillment_lines_to_create: list[FulfillmentLine] = []
@@ -1449,7 +1424,7 @@ def _move_order_lines_to_target_fulfillment(
 
         if lines_to_dellocate:
             try:
-                deallocate_stock(lines_to_dellocate, manager)
+                deallocate_stock(lines_to_dellocate, site_settings, requestor)
             except AllocationError as e:
                 lines = [str(line.pk) for line in e.order_lines]
                 logger.warning(
@@ -1538,6 +1513,7 @@ def create_refund_fulfillment(
     order_lines_to_refund: list[OrderLineInfo],
     fulfillment_lines_to_refund: list[FulfillmentLineData],
     manager: "PluginsManager",
+    site_settings: "SiteSettings",
     amount=None,
     refund_shipping_costs=False,
 ):
@@ -1574,7 +1550,8 @@ def create_refund_fulfillment(
         created_fulfillment_lines = _move_order_lines_to_target_fulfillment(
             order_lines_to_move=order_lines_to_refund,
             target_fulfillment=refunded_fulfillment,
-            manager=manager,
+            site_settings=site_settings,
+            requestor=app or user,
         )
 
         _move_fulfillment_lines_to_target_fulfillment(
@@ -1597,7 +1574,9 @@ def create_refund_fulfillment(
     return refunded_fulfillment
 
 
-def _populate_replace_order_fields(original_order: "Order"):
+def _populate_replace_order_fields(
+    original_order: "Order", replace_lines_count: int = 0
+) -> "Order":
     replace_order = Order()
     replace_order.status = OrderStatus.DRAFT
     replace_order.user_id = original_order.user_id
@@ -1611,6 +1590,7 @@ def _populate_replace_order_fields(original_order: "Order"):
     replace_order.origin = OrderOrigin.REISSUE
     replace_order.metadata = original_order.metadata
     replace_order.private_metadata = original_order.private_metadata
+    replace_order.lines_count = replace_lines_count
 
     if original_order.billing_address:
         original_order.billing_address.pk = None
@@ -1634,7 +1614,14 @@ def create_replace_order(
 ) -> "Order":
     """Create draft order with lines to replace."""
 
-    replace_order = _populate_replace_order_fields(original_order)
+    order_lines_with_fulfillment = OrderLine.objects.in_bulk(
+        [line_data.line.order_line_id for line_data in fulfillment_lines_to_replace]
+    )
+    replace_lines_count = len(
+        {line.line.id for line in order_lines_to_replace}
+        | set(order_lines_with_fulfillment.keys())
+    )
+    replace_order = _populate_replace_order_fields(original_order, replace_lines_count)
     order_line_to_create: dict[OrderLineIDType, OrderLine] = {}
     # transaction is needed to ensure data consistency for order lines
     with traced_atomic_transaction():
@@ -1652,9 +1639,6 @@ def create_replace_order(
             # items
             order_line_to_create[order_line_id] = order_line
 
-        order_lines_with_fulfillment = OrderLine.objects.in_bulk(
-            [line_data.line.order_line_id for line_data in fulfillment_lines_to_replace]
-        )
         for fulfillment_line_data in fulfillment_lines_to_replace:
             fulfillment_line = fulfillment_line_data.line
             order_line_id = fulfillment_line.order_line_id
@@ -1698,7 +1682,8 @@ def _move_lines_to_return_fulfillment(
     order: "Order",
     total_refund_amount: Decimal | None,
     shipping_refund_amount: Decimal | None,
-    manager: "PluginsManager",
+    site_settings: "SiteSettings",
+    requestor: "App | User | None",
 ) -> Fulfillment:
     target_fulfillment = Fulfillment.objects.create(
         status=fulfillment_status,
@@ -1709,7 +1694,8 @@ def _move_lines_to_return_fulfillment(
     lines_in_target_fulfillment = _move_order_lines_to_target_fulfillment(
         order_lines_to_move=order_lines,
         target_fulfillment=target_fulfillment,
-        manager=manager,
+        site_settings=site_settings,
+        requestor=requestor,
     )
 
     fulfillment_lines_already_refunded = FulfillmentLine.objects.filter(
@@ -1754,7 +1740,8 @@ def _move_lines_to_replace_fulfillment(
     order_lines_to_replace: list[OrderLineInfo],
     fulfillment_lines_to_replace: list[FulfillmentLineData],
     order: "Order",
-    manager: "PluginsManager",
+    site_settings: "SiteSettings",
+    requestor: "App | User | None",
 ) -> Fulfillment:
     target_fulfillment = Fulfillment.objects.create(
         status=FulfillmentStatus.REPLACED, order=order
@@ -1762,7 +1749,8 @@ def _move_lines_to_replace_fulfillment(
     lines_in_target_fulfillment = _move_order_lines_to_target_fulfillment(
         order_lines_to_move=order_lines_to_replace,
         target_fulfillment=target_fulfillment,
-        manager=manager,
+        site_settings=site_settings,
+        requestor=requestor,
     )
     _move_fulfillment_lines_to_target_fulfillment(
         fulfillment_lines_to_move=fulfillment_lines_to_replace,
@@ -1780,7 +1768,7 @@ def create_return_fulfillment(
     fulfillment_lines: list[FulfillmentLineData],
     total_refund_amount: Decimal | None,
     shipping_refund_amount: Decimal | None,
-    manager: "PluginsManager",
+    site_settings: "SiteSettings",
 ) -> Fulfillment:
     status = FulfillmentStatus.RETURNED
     if total_refund_amount is not None:
@@ -1793,7 +1781,8 @@ def create_return_fulfillment(
             order=order,
             total_refund_amount=total_refund_amount,
             shipping_refund_amount=shipping_refund_amount,
-            manager=manager,
+            site_settings=site_settings,
+            requestor=app or user,
         )
         returned_lines: dict[OrderLineIDType, tuple[QuantityType, OrderLine]] = {}
         order_lines_with_fulfillment = OrderLine.objects.in_bulk(
@@ -1833,6 +1822,7 @@ def process_replace(
     order_lines: list[OrderLineInfo],
     fulfillment_lines: list[FulfillmentLineData],
     manager: "PluginsManager",
+    site_settings: "SiteSettings",
 ) -> tuple[Fulfillment, Optional["Order"]]:
     """Create replace fulfillment and new draft order.
 
@@ -1845,7 +1835,8 @@ def process_replace(
             order_lines_to_replace=order_lines,
             fulfillment_lines_to_replace=fulfillment_lines,
             order=order,
-            manager=manager,
+            site_settings=site_settings,
+            requestor=app or user,
         )
         new_order = create_replace_order(
             user=user,
@@ -1878,6 +1869,7 @@ def create_fulfillments_for_returned_products(
     order_lines: list[OrderLineInfo],
     fulfillment_lines: list[FulfillmentLineData],
     manager: "PluginsManager",
+    site_settings: "SiteSettings",
     refund: bool = False,
     amount: Decimal | None = None,
     refund_shipping_costs=False,
@@ -1936,6 +1928,7 @@ def create_fulfillments_for_returned_products(
                 order_lines=replace_order_lines,
                 fulfillment_lines=replace_fulfillment_lines,
                 manager=manager,
+                site_settings=site_settings,
             )
         return_fulfillment = create_return_fulfillment(
             user=user,
@@ -1945,7 +1938,7 @@ def create_fulfillments_for_returned_products(
             fulfillment_lines=return_fulfillment_lines,
             total_refund_amount=total_refund_amount,
             shipping_refund_amount=shipping_refund_amount,
-            manager=manager,
+            site_settings=site_settings,
         )
         Fulfillment.objects.filter(
             order=order,
@@ -1957,6 +1950,10 @@ def create_fulfillments_for_returned_products(
         ).delete()
 
         call_order_event(manager, WebhookEventAsyncType.ORDER_UPDATED, order)
+        if new_order:
+            call_order_event(
+                manager, WebhookEventAsyncType.DRAFT_ORDER_CREATED, new_order
+            )
     return return_fulfillment, replace_fulfillment, new_order
 
 
@@ -2022,7 +2019,10 @@ def _process_refund(
             amount += order.shipping_price_gross_amount
     if amount and payment:
         amount = min(payment.captured_amount, amount)
-        gateway.refund(
+        # Circular imports
+        from ..payment.gateway import refund
+
+        refund(
             payment,
             manager,
             amount=amount,

@@ -12,6 +12,7 @@ from ...transport.asynchronous.transport import (
     trigger_webhooks_async_for_multiple_objects,
 )
 from ...transport.synchronous import trigger_webhook_sync
+from ...transport.utils import get_sqs_message_group_id
 from .payloads import generate_payment_payload
 
 
@@ -36,11 +37,14 @@ def test_trigger_webhooks_async(
     for delivery in deliveries:
         assert (
             mock.call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={
+                    "event_delivery_id": delivery.id,
+                    "telemetry_context": mock.ANY,
+                },
                 queue=None,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId=get_sqs_message_group_id(
+                    "example.com", delivery.webhook.app
+                ),
             )
             in mocked_send_webhook_request.mock_calls
         )
@@ -98,11 +102,14 @@ def test_trigger_webhooks_async_for_multiple_objects(
     for delivery in deliveries:
         assert (
             mock.call(
-                kwargs={"event_delivery_id": delivery.id},
+                kwargs={
+                    "event_delivery_id": delivery.id,
+                    "telemetry_context": mock.ANY,
+                },
                 queue=None,
-                bind=True,
-                retry_backoff=10,
-                retry_kwargs={"max_retries": 5},
+                MessageGroupId=get_sqs_message_group_id(
+                    "example.com", delivery.webhook.app
+                ),
             )
             in mocked_send_webhook_request.mock_calls
         )
@@ -134,7 +141,7 @@ def test_trigger_webhook_sync_with_subscription(
     # given
     payment_app = payment_app_with_subscription_webhooks
     data = '{"key": "value"}'
-    expected_payment_payload = generate_payment_payload(payment)
+    expected_payment_payload = generate_payment_payload(payment, payment_app)
     # when
     trigger_webhook_sync(
         WebhookEventSyncType.PAYMENT_AUTHORIZE,

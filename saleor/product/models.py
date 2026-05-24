@@ -1,9 +1,7 @@
-import copy
 import datetime
 from collections.abc import Iterable
 from decimal import Decimal
 from typing import Optional
-from uuid import uuid4
 
 import graphene
 from django.conf import settings
@@ -12,18 +10,16 @@ from django.contrib.postgres.search import SearchVectorField
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import JSONField, TextField
-from django.forms.models import model_to_dict
-from django.urls import reverse
 from django.utils import timezone
 from django_measurement.models import MeasurementField
-from django_prices.models import MoneyField
 from measurement.measures import Weight
 from mptt.managers import TreeManager
 from mptt.models import MPTTModel
 from prices import Money
 
 from ..channel.models import Channel
-from ..core.db.fields import SanitizedJSONField
+from ..core.db.fields import MoneyField, SanitizedJSONField
+from ..core.editorjs import clean_editorjs
 from ..core.models import (
     ModelWithExternalReference,
     ModelWithMetadata,
@@ -31,9 +27,7 @@ from ..core.models import (
     SortableModel,
 )
 from ..core.units import WeightUnits
-from ..core.utils import build_absolute_uri
-from ..core.utils.editorjs import clean_editor_js
-from ..core.utils.translations import Translation, get_translation
+from ..core.utils.translations import Translation
 from ..core.weight import zero_weight
 from ..discount.models import PromotionRule
 from ..permission.enums import (
@@ -58,7 +52,7 @@ ALL_PRODUCTS_PERMISSIONS = [
 class Category(ModelWithMetadata, MPTTModel, SeoModel):
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
     description_plaintext = TextField(blank=True)
     updated_at = models.DateTimeField(auto_now=True, blank=True, null=True)
     parent = models.ForeignKey(
@@ -93,7 +87,7 @@ class CategoryTranslation(SeoModelTranslationWithSlug):
         Category, related_name="translations", on_delete=models.CASCADE
     )
     name = models.CharField(max_length=128, blank=True, null=True)
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
 
     class Meta:
         constraints = [
@@ -105,7 +99,7 @@ class CategoryTranslation(SeoModelTranslationWithSlug):
         unique_together = (("language_code", "category"),)
 
     def __str__(self) -> str:
-        return self.name if self.name else str(self.pk)
+        return self.name or str(self.pk)
 
     def __repr__(self) -> str:
         class_ = type(self)
@@ -129,9 +123,12 @@ class ProductType(ModelWithMetadata):
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     kind = models.CharField(max_length=32, choices=ProductTypeKind.CHOICES)
-    has_variants = models.BooleanField(default=True)
     is_shipping_required = models.BooleanField(default=True)
+
+    # Note: has no effect, it's only kept for backward-compatibility as some users
+    #       use that field. Will be removed in Saleor v3.24.0
     is_digital = models.BooleanField(default=False)
+
     weight = MeasurementField(
         measurement=Weight,
         unit_choices=WeightUnits.CHOICES,
@@ -144,6 +141,9 @@ class ProductType(ModelWithMetadata):
         blank=True,
         null=True,
     )
+
+    # DEPRECATED, does not affect the variant creation anymore
+    has_variants = models.BooleanField(default=True)
 
     class Meta(ModelWithMetadata.Meta):
         ordering = ("slug",)
@@ -168,8 +168,7 @@ class ProductType(ModelWithMetadata):
         return self.name
 
     def __repr__(self) -> str:
-        class_ = type(self)
-        return f"<{class_.__module__}.{class_.__name__}(pk={self.pk!r}, name={self.name!r})>"
+        return f"<ProductType: pk={self.pk!r}, name={self.name!r}>"
 
 
 class Product(SeoModel, ModelWithMetadata, ModelWithExternalReference):
@@ -178,7 +177,7 @@ class Product(SeoModel, ModelWithMetadata, ModelWithExternalReference):
     )
     name = models.CharField(max_length=250)
     slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
     description_plaintext = TextField(blank=True)
     search_document = models.TextField(blank=True, default="")
     search_vector = SearchVectorField(blank=True, null=True)
@@ -250,8 +249,7 @@ class Product(SeoModel, ModelWithMetadata, ModelWithExternalReference):
         return iter(getattr(self, "__variants"))
 
     def __repr__(self) -> str:
-        class_ = type(self)
-        return f"<{class_.__module__}.{class_.__name__}(pk={self.pk!r}, name={self.name!r})>"
+        return f"<Product: pk={self.pk!r}, name={self.name!r}>"
 
     def __str__(self) -> str:
         return self.name
@@ -271,7 +269,7 @@ class ProductTranslation(SeoModelTranslationWithSlug):
         Product, related_name="translations", on_delete=models.CASCADE
     )
     name = models.CharField(max_length=250, blank=True, null=True)
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
 
     class Meta:
         constraints = [
@@ -283,7 +281,7 @@ class ProductTranslation(SeoModelTranslationWithSlug):
         unique_together = (("language_code", "product"),)
 
     def __str__(self) -> str:
-        return self.name if self.name else str(self.pk)
+        return self.name or str(self.pk)
 
     def __repr__(self) -> str:
         class_ = type(self)
@@ -378,6 +376,14 @@ class ProductVariant(SortableModel, ModelWithMetadata, ModelWithExternalReferenc
     class Meta(ModelWithMetadata.Meta):
         ordering = ("sort_order", "sku")
         app_label = "product"
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            GinIndex(
+                name="variant_gin",
+                fields=["name", "sku"],
+                opclasses=["gin_trgm_ops"] * 2,
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name or self.sku or f"ID:{self.pk}"
@@ -436,22 +442,6 @@ class ProductVariant(SortableModel, ModelWithMetadata, ModelWithExternalReferenc
     def is_gift_card(self) -> bool:
         return self.product.product_type.kind == ProductTypeKind.GIFT_CARD
 
-    def is_digital(self) -> bool:
-        is_digital = self.product.product_type.is_digital
-        return not self.is_shipping_required() and is_digital
-
-    def display_product(self, translated: bool = False) -> str:
-        if translated:
-            product = get_translation(self.product).name or ""
-            variant_display = get_translation(self).name
-        else:
-            variant_display = str(self)
-            product = self.product
-        product_display = (
-            f"{product} ({variant_display})" if variant_display else str(product)
-        )
-        return product_display
-
     def get_ordering_queryset(self):
         return self.product.variants.all()
 
@@ -459,25 +449,6 @@ class ProductVariant(SortableModel, ModelWithMetadata, ModelWithExternalReferenc
         return self.is_preorder and (
             self.preorder_end_date is None or timezone.now() <= self.preorder_end_date
         )
-
-    @property
-    def comparison_fields(self):
-        return [
-            "sku",
-            "name",
-            "track_inventory",
-            "is_preorder",
-            "quantity_limit_per_customer",
-            "weight",
-            "external_reference",
-            "metadata",
-            "private_metadata",
-            "preorder_end_date",
-            "preorder_global_threshold",
-        ]
-
-    def serialize_for_comparison(self):
-        return copy.deepcopy(model_to_dict(self, fields=self.comparison_fields))
 
 
 class ProductVariantTranslation(Translation):
@@ -556,7 +527,7 @@ class ProductVariantChannelListing(models.Model):
     )
     promotion_rules = models.ManyToManyField(
         PromotionRule,
-        help_text=("Promotion rules that were included in the discounted price."),
+        help_text="Promotion rules that were included in the discounted price.",
         through="product.VariantChannelListingPromotionRule",
         blank=True,
     )
@@ -596,50 +567,6 @@ class VariantChannelListingPromotionRule(models.Model):
 
     class Meta:
         unique_together = [["variant_channel_listing", "promotion_rule"]]
-
-
-class DigitalContent(ModelWithMetadata):
-    FILE = "file"
-    TYPE_CHOICES = ((FILE, "digital_product"),)
-    use_default_settings = models.BooleanField(default=True)
-    automatic_fulfillment = models.BooleanField(default=False)
-    content_type = models.CharField(max_length=128, default=FILE, choices=TYPE_CHOICES)
-    product_variant = models.OneToOneField(
-        ProductVariant, related_name="digital_content", on_delete=models.CASCADE
-    )
-    content_file = models.FileField(upload_to="digital_contents", blank=True)
-    max_downloads = models.IntegerField(blank=True, null=True)
-    url_valid_days = models.IntegerField(blank=True, null=True)
-
-    def create_new_url(self) -> "DigitalContentUrl":
-        return self.urls.create()
-
-
-class DigitalContentUrl(models.Model):
-    token = models.UUIDField(editable=False, unique=True)
-    content = models.ForeignKey(
-        DigitalContent, related_name="urls", on_delete=models.CASCADE
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    download_num = models.IntegerField(default=0)
-    line = models.OneToOneField(
-        "order.OrderLine",
-        related_name="digital_content_url",
-        blank=True,
-        null=True,
-        on_delete=models.CASCADE,
-    )
-
-    def save(
-        self, force_insert=False, force_update=False, using=None, update_fields=None
-    ):
-        if not self.token:
-            self.token = str(uuid4()).replace("-", "")
-        super().save(force_insert, force_update, using, update_fields)
-
-    def get_absolute_url(self) -> str | None:
-        url = reverse("digital-product", kwargs={"token": str(self.token)})
-        return build_absolute_uri(url)
 
 
 class ProductMedia(SortableModel, ModelWithMetadata):
@@ -719,7 +646,7 @@ class Collection(SeoModel, ModelWithMetadata):
     )
     background_image_alt = models.CharField(max_length=128, blank=True)
 
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
 
     objects = managers.CollectionManager()
 
@@ -765,7 +692,7 @@ class CollectionTranslation(SeoModelTranslationWithSlug):
         Collection, related_name="translations", on_delete=models.CASCADE
     )
     name = models.CharField(max_length=128, blank=True, null=True)
-    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editor_js)
+    description = SanitizedJSONField(blank=True, null=True, sanitizer=clean_editorjs)
 
     class Meta:
         constraints = [
@@ -781,7 +708,7 @@ class CollectionTranslation(SeoModelTranslationWithSlug):
         return f"{class_.__name__}(pk={self.pk!r}, name={self.name!r}, collection_pk={self.collection_id!r})"
 
     def __str__(self) -> str:
-        return self.name if self.name else str(self.pk)
+        return self.name or str(self.pk)
 
     def get_translated_object_id(self):
         return "Collection", self.collection_id

@@ -1,4 +1,5 @@
 import graphene
+from django.conf import settings
 from django.utils.text import slugify
 
 from ....channel import models
@@ -11,6 +12,9 @@ from ...core import ResolveInfo
 from ...core.descriptions import (
     ADDED_IN_318,
     ADDED_IN_320,
+    ADDED_IN_321,
+    ADDED_IN_322,
+    ADDED_IN_323,
     DEPRECATED_IN_3X_INPUT,
     PREVIEW_FEATURE,
 )
@@ -21,12 +25,12 @@ from ...core.doc_category import (
     DOC_CATEGORY_PAYMENTS,
     DOC_CATEGORY_PRODUCTS,
 )
-from ...core.mutations import ModelMutation
-from ...core.scalars import Day, Minute
+from ...core.mutations import DeprecatedModelMutation
+from ...core.scalars import DateTime, Day, Hour, Minute
 from ...core.types import BaseInputObjectType, ChannelError, NonNullList
 from ...core.types import common as common_types
 from ...core.utils import WebhookEventInfo
-from ...meta.inputs import MetadataInput
+from ...meta.inputs import MetadataInput, MetadataInputDescription
 from ...plugins.dataloaders import get_plugin_manager_promise
 from ..enums import (
     AllocationStrategyEnum,
@@ -54,6 +58,45 @@ class StockSettingsInput(BaseInputObjectType):
         doc_category = DOC_CATEGORY_PRODUCTS
 
 
+class CheckoutAutoCompleteInput(BaseInputObjectType):
+    enabled = graphene.Boolean(
+        required=True,
+        description=(
+            "Default `false`. Determines if the paid checkouts should be automatically "
+            "completed. This setting applies only to checkouts where payment "
+            "was processed through transactions."
+            "When enabled, the checkout will be automatically completed once the "
+            "checkout `charge_status` reaches `FULL`. This occurs when the total sum "
+            "of charged and authorized transaction amounts equals or exceeds the "
+            "checkout's total amount."
+        ),
+    )
+    delay = Minute(
+        required=False,
+        description=(
+            "The time in minutes after which the fully paid checkout will be "
+            "automatically completed. Default is "
+            f"{settings.DEFAULT_AUTOMATIC_CHECKOUT_COMPLETION_DELAY}. "
+            "Set to 0 for immediate completion. "
+            "Should be less than the threshold for the oldest modified checkout "
+            "eligible for automatic completion."
+        ),
+    )
+    cut_off_date = DateTime(
+        required=False,
+        description=(
+            "Specifies the earliest date on which fully paid checkouts can begin "
+            "to be automatically completed. Fully paid checkouts dated before this "
+            "cut-off will not be automatically completed. Must be less than the "
+            "threshold of the oldest modified checkout eligible for automatic "
+            "completion. Default is current date time."
+        ),
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_CHECKOUT
+
+
 class CheckoutSettingsInput(BaseInputObjectType):
     use_legacy_error_flow = graphene.Boolean(
         description=(
@@ -74,11 +117,26 @@ class CheckoutSettingsInput(BaseInputObjectType):
             "completed. This setting applies only to checkouts where payment "
             "was processed through transactions."
             "When enabled, the checkout will be automatically completed once the "
-            "checkout `charge_status` reaches `FULL`. This occurs when the total sum "
+            "checkout `authorize_status` reaches `FULL`. This occurs when the total sum "
             "of charged and authorized transaction amounts equals or exceeds the "
             "checkout's total amount."
+            + ADDED_IN_320
+            + DEPRECATED_IN_3X_INPUT
+            + " Use `automatic_completion` instead."
         )
-        + ADDED_IN_320,
+    )
+    automatic_completion = CheckoutAutoCompleteInput(
+        description="Settings for automatic completion of fully paid checkouts."
+        + ADDED_IN_322,
+        required=False,
+    )
+    allow_legacy_gift_card_use = graphene.Boolean(
+        description=(
+            "Default to `true`. Determines whether gift cards can be attached to "
+            "a Checkout via `addPromoCode` mutation. Usage of this mutation with gift cards "
+            "is deprecated."
+        )
+        + ADDED_IN_323,
     )
 
     class Meta:
@@ -140,6 +198,34 @@ class OrderSettingsInput(BaseInputObjectType):
             + PREVIEW_FEATURE
         ),
     )
+    draft_order_line_price_freeze_period = Hour(
+        required=False,
+        description=(
+            "Time in hours after which the draft order line price will be refreshed. "
+            "Default value is 24 hours. "
+            "Enter 0 or null to disable." + ADDED_IN_321 + PREVIEW_FEATURE
+        ),
+    )
+
+    use_legacy_line_discount_propagation = graphene.Boolean(
+        required=False,
+        description=(
+            "This flag only affects orders created from checkout and applies "
+            "specifically to vouchers of the types: `SPECIFIC_PRODUCT` and "
+            "`ENTIRE_ORDER` with `applyOncePerOrder` enabled."
+            "\n- When legacy propagation is enabled, discounts from these "
+            "vouchers are represented as `OrderDiscount` objects, attached to "
+            "the order and returned in the `Order.discounts` field. "
+            "Additionally, percentage-based vouchers are converted to "
+            "fixed-value discounts."
+            "\n- When legacy propagation is disabled, discounts are represented "
+            "as `OrderLineDiscount` objects, attached to individual lines and "
+            "returned in the `OrderLine.discounts` field. In this case, "
+            "percentage-based vouchers retain their original type."
+            "\nIn future releases, `OrderLineDiscount` will become the default "
+            "behavior, and this flag will be deprecated and removed." + ADDED_IN_321
+        ),
+    )
 
     class Meta:
         doc_category = DOC_CATEGORY_ORDERS
@@ -152,6 +238,29 @@ class PaymentSettingsInput(BaseInputObjectType):
             "Determine the transaction flow strategy to be used. "
             "Include the selected option in the payload sent to the payment app, as a "
             "requested action for the transaction."
+        ),
+    )
+    release_funds_for_expired_checkouts = graphene.Boolean(
+        required=False,
+        description=(
+            "Determine if the funds for expired checkouts should be released automatically."
+            + ADDED_IN_320
+        ),
+    )
+    checkout_ttl_before_releasing_funds = Hour(
+        required=False,
+        description=(
+            "The time in hours after which funds for expired checkouts will be released."
+            + ADDED_IN_320
+        ),
+    )
+    checkout_release_funds_cut_off_date = DateTime(
+        required=False,
+        description=(
+            "Specifies the earliest date on which funds for expired checkouts can begin "
+            "to be released. Expired checkouts dated before this cut-off will not have their "
+            "funds released. Additionally, no funds will be released for checkouts that are "
+            "more than one year old, regardless of the cut-off date." + ADDED_IN_320
         ),
     )
 
@@ -185,12 +294,15 @@ class ChannelInput(BaseInputObjectType):
     )
     metadata = common_types.NonNullList(
         MetadataInput,
-        description="Channel public metadata.",
+        description=(
+            f"Channel public metadata. {MetadataInputDescription.PUBLIC_METADATA_INPUT}"
+        ),
         required=False,
     )
     private_metadata = common_types.NonNullList(
         MetadataInput,
-        description="Channel private metadata.",
+        description="Channel private metadata. "
+        f"{MetadataInputDescription.PRIVATE_METADATA_INPUT}",
         required=False,
     )
 
@@ -228,14 +340,14 @@ class ChannelCreateInput(ChannelInput):
         doc_category = DOC_CATEGORY_CHANNELS
 
 
-class ChannelCreate(ModelMutation):
+class ChannelCreate(DeprecatedModelMutation):
     class Arguments:
         input = ChannelCreateInput(
             required=True, description="Fields required to create channel."
         )
 
     class Meta:
-        description = "Creates new channel."
+        description = "Creates a new channel."
         model = models.Channel
         object_type = Channel
         permissions = (ChannelPermissions.MANAGE_CHANNELS,)
@@ -262,8 +374,11 @@ class ChannelCreate(ModelMutation):
             cleaned_input["slug"] = slugify(slug)
         if stock_settings := cleaned_input.get("stock_settings"):
             cleaned_input["allocation_strategy"] = stock_settings["allocation_strategy"]
-        if order_settings := cleaned_input.get("order_settings"):
-            clean_input_order_settings(order_settings, cleaned_input, instance)
+
+        order_settings = cleaned_input.get("order_settings") or {
+            "use_legacy_line_discount_propagation_for_order": False
+        }
+        clean_input_order_settings(order_settings, cleaned_input, instance)
 
         if checkout_settings := cleaned_input.get("checkout_settings"):
             clean_input_checkout_settings(checkout_settings, cleaned_input)

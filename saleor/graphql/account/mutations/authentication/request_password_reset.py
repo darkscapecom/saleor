@@ -8,12 +8,14 @@ from .....account.tasks import trigger_send_password_reset_notification
 from .....account.utils import RequestorAwareContext, retrieve_user_by_email
 from .....core.utils.url import validate_storefront_url
 from .....webhook.event_types import WebhookEventAsyncType
-from ....channel.utils import clean_channel, validate_channel
+from ....channel.utils import clean_channel
 from ....core import ResolveInfo
 from ....core.doc_category import DOC_CATEGORY_USERS
 from ....core.mutations import BaseMutation
 from ....core.types import AccountError
 from ....core.utils import WebhookEventInfo
+from ....site.dataloaders import get_site_promise
+from .utils import check_password_login_not_disabled
 
 
 class RequestPasswordReset(BaseMutation):
@@ -30,7 +32,11 @@ class RequestPasswordReset(BaseMutation):
             ),
         )
         channel = graphene.String(
-            description="Slug of a channel which will be used for notify user."
+            description=(
+                "Slug of a channel which will be used to notify the user. "
+                "It is needed for customers, if not provided, the notification may not happen. "
+                "Please note that mutation will not fail if the channel is not provided. "
+            )
         )
 
     class Meta:
@@ -76,15 +82,24 @@ class RequestPasswordReset(BaseMutation):
 
     @classmethod
     def perform_mutation(cls, _root, info: ResolveInfo, /, **data):
+        site_settings = get_site_promise(info.context).get().settings
+        check_password_login_not_disabled(site_settings)
+
         email = data["email"]
         redirect_url = data["redirect_url"]
         user = cls.clean_user(email, redirect_url)
-        channel_slug = data.get("channel")
+        channel = data.get("channel")
 
-        channel_slug = clean_channel(
-            channel_slug, error_class=AccountErrorCode, allow_replica=False
-        ).slug
-        channel_slug = validate_channel(channel_slug, error_class=AccountErrorCode).slug
+        # Catching exception for backwards compatibility
+        # Previously channel_slug was validated and error returner, we don't want to
+        # return error to end user to prevent user enumeration.
+        # Exception catching should be removed after logic for default_channel is removed
+        try:
+            channel_slug = clean_channel(
+                channel, error_class=AccountErrorCode, allow_replica=False
+            ).slug
+        except ValidationError:
+            channel_slug = None
 
         trigger_send_password_reset_notification.delay(
             redirect_url=redirect_url,

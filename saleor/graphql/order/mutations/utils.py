@@ -1,26 +1,59 @@
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Union
 
 import graphene
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from promise import Promise
 
 from ....checkout.fetch import get_variant_channel_listing
 from ....core.taxes import zero_money, zero_taxed_money
+from ....core.utils import metadata_manager
+from ....discount import VoucherType
 from ....discount.interface import VariantPromotionRuleInfo, fetch_variant_rules_info
-from ....order import ORDER_EDITABLE_STATUS, OrderStatus, events
+from ....discount.utils.manual_discount import apply_discount_to_value
+from ....order import ORDER_EDITABLE_STATUS, OrderStatus, events, models
 from ....order.actions import call_order_event
 from ....order.error_codes import OrderErrorCode
 from ....order.utils import invalidate_order_prices
 from ....payment import PaymentError
 from ....payment import models as payment_models
-from ....plugins.manager import PluginsManager
 from ....product import models as product_models
 from ....shipping.interface import ShippingMethodData
-from ....shipping.models import ShippingMethodChannelListing
+from ....shipping.models import ShippingMethod, ShippingMethodChannelListing
+from ....shipping.utils import convert_to_shipping_method_data
 from ....webhook.event_types import WebhookEventAsyncType
+from ...meta.mutations.utils import update_metadata, update_private_metadata
 from ..utils import get_shipping_method_availability_error
 
-SHIPPING_METHOD_UPDATE_FIELDS = [
+if TYPE_CHECKING:
+    from ....account.models import User
+    from ....app.models import App
+
+DRAFT_ORDER_UPDATE_FIELDS = {
+    "base_shipping_price_amount",
+    "billing_address",
+    "channel",
+    "collection_point",
+    "collection_point_name",
+    "customer_note",
+    "display_gross_prices",
+    "draft_save_billing_address",
+    "draft_save_shipping_address",
+    "external_reference",
+    "language_code",
+    "metadata",
+    "private_metadata",
+    "redirect_url",
+    "search_vector",
+    "shipping_address",
+    "user",
+    "user_email",
+    "voucher",
+    "voucher_code",
+    "weight",
+}
+
+SHIPPING_METHOD_UPDATE_FIELDS = {
     "currency",
     "shipping_method",
     "shipping_price_net_amount",
@@ -35,7 +68,18 @@ SHIPPING_METHOD_UPDATE_FIELDS = [
     "shipping_tax_rate",
     "should_refresh_prices",
     "updated_at",
-]
+}
+
+ORDER_UPDATE_FIELDS = {
+    "billing_address",
+    "external_reference",
+    "language_code",
+    "metadata",
+    "private_metadata",
+    "shipping_address",
+    "user",
+    "user_email",
+}
 
 
 class EditableOrderValidationMixin:
@@ -57,9 +101,6 @@ class EditableOrderValidationMixin:
 
 
 class ShippingMethodUpdateMixin:
-    class Meta:
-        abstract = True
-
     @classmethod
     def clear_shipping_method_from_order(cls, order):
         order.shipping_method = None
@@ -75,16 +116,21 @@ class ShippingMethodUpdateMixin:
         invalidate_order_prices(order)
 
     @classmethod
-    def update_shipping_method(cls, order, method, shipping_method_data):
+    def update_shipping_method(cls, order: models.Order, method: ShippingMethod):
         order.shipping_method = method
         order.shipping_method_name = method.name
 
         tax_class = method.tax_class
+        order.shipping_tax_class = tax_class
         if tax_class:
-            order.shipping_tax_class = tax_class
             order.shipping_tax_class_name = tax_class.name
             order.shipping_tax_class_private_metadata = tax_class.private_metadata
             order.shipping_tax_class_metadata = tax_class.metadata
+        else:
+            order.shipping_tax_class_name = None
+            order.shipping_tax_class_private_metadata = {}
+            order.shipping_tax_class_metadata = {}
+
         invalidate_order_prices(order)
 
     @classmethod
@@ -104,11 +150,12 @@ class ShippingMethodUpdateMixin:
         return shipping_channel_listing
 
     @classmethod
-    def _update_shipping_price(
-        cls,
-        order,
-        shipping_channel_listing,
-    ):
+    def update_shipping_price(cls, order, shipping_channel_listing):
+        cls.assign_shipping_price(order, shipping_channel_listing)
+        cls.update_shipping_discount(order)
+
+    @classmethod
+    def assign_shipping_price(cls, order, shipping_channel_listing):
         if not shipping_channel_listing:
             order.base_shipping_price = zero_money(order.currency)
             order.undiscounted_base_shipping_price = zero_money(order.currency)
@@ -119,30 +166,90 @@ class ShippingMethodUpdateMixin:
             and order.shipping_address
             and order.is_shipping_required()
         ):
-            order.base_shipping_price = shipping_channel_listing.price
-            order.undiscounted_base_shipping_price = shipping_channel_listing.price
+            undiscounted_shipping_price = shipping_channel_listing.price
+            order.undiscounted_base_shipping_price = undiscounted_shipping_price
+            order.base_shipping_price = undiscounted_shipping_price
+
         else:
             order.base_shipping_price = zero_money(order.currency)
             order.undiscounted_base_shipping_price = zero_money(order.currency)
 
+    @classmethod
+    def update_shipping_discount(cls, order: models.Order):
+        if shipping_discount := order.discounts.filter(
+            voucher__type=VoucherType.SHIPPING
+        ).first():
+            undiscounted_shipping_price = order.undiscounted_base_shipping_price
+            shipping_price = apply_discount_to_value(
+                value=shipping_discount.value,
+                value_type=shipping_discount.value_type,
+                currency=order.currency,
+                price_to_discount=undiscounted_shipping_price,
+            )
+            order.base_shipping_price = shipping_price
+            shipping_discount_amount = undiscounted_shipping_price - shipping_price
+            if shipping_discount.amount != shipping_discount_amount:
+                shipping_discount.amount = shipping_discount_amount
+                shipping_discount.save(update_fields=["amount_value"])
+
+    @classmethod
+    def process_shipping_method(
+        cls,
+        order: models.Order,
+        method: ShippingMethod,
+        requestor: Union["App", "User", None],
+        update_shipping_discount: bool,
+    ) -> Promise[None]:
+        shipping_channel_listing = cls.validate_shipping_channel_listing(method, order)
+
+        promised_clean_shipping = Promise.resolve(None)
+        if order.status != OrderStatus.DRAFT:
+            shipping_method_data = convert_to_shipping_method_data(
+                method,
+                shipping_channel_listing,
+            )
+            promised_clean_shipping = clean_order_update_shipping(
+                order, shipping_method_data, requestor
+            )
+
+        def update_shipping(_):
+            cls.update_shipping_method(order, method)
+            cls.assign_shipping_price(order, shipping_channel_listing)
+            # for new instance the shipping discount is created later
+            if update_shipping_discount:
+                cls.update_shipping_discount(order)
+
+        return promised_clean_shipping.then(update_shipping)
+
 
 def clean_order_update_shipping(
-    order, method: ShippingMethodData, manager: "PluginsManager"
-):
-    if not order.shipping_address:
-        raise ValidationError(
-            {
-                "order": ValidationError(
-                    "Cannot choose a shipping method for an order without "
-                    "the shipping address.",
-                    code=OrderErrorCode.ORDER_NO_SHIPPING_ADDRESS.value,
-                )
-            }
+    order,
+    method: ShippingMethodData,
+    requestor: Union["App", "User", None],
+) -> Promise[None]:
+    def check_shipping(_):
+        if not order.shipping_address_id:
+            raise ValidationError(
+                {
+                    "order": ValidationError(
+                        "Cannot choose a shipping method for an order without "
+                        "the shipping address.",
+                        code=OrderErrorCode.ORDER_NO_SHIPPING_ADDRESS.value,
+                    )
+                }
+            )
+
+        promised_availability_error = get_shipping_method_availability_error(
+            order, method, requestor
         )
 
-    error = get_shipping_method_availability_error(order, method, manager)
-    if error:
-        raise ValidationError({"shipping_method": error})
+        def handle_availability_error(error):
+            if error:
+                raise ValidationError({"shipping_method": error})
+
+        return promised_availability_error.then(handle_availability_error)
+
+    return Promise.resolve(None).then(check_shipping)
 
 
 def call_event_by_order_status(order, manager):
@@ -201,7 +308,6 @@ def get_variant_rule_info_map(
     variants = product_models.ProductVariant.objects.filter(
         pk__in=variant_ids
     ).prefetch_related(
-        "channel_listings__variantlistingpromotionrule__promotion_rule__promotion",
         "channel_listings__variantlistingpromotionrule__promotion_rule__promotion__translations",
         "channel_listings__variantlistingpromotionrule__promotion_rule__translations",
     )
@@ -213,3 +319,32 @@ def get_variant_rule_info_map(
         ] = VariantData(variant=variant, rules_info=rules_info)
 
     return variant_id_to_variant_and_rules_info_map
+
+
+def save_addresses(instance: models.Order, cleaned_input: dict) -> list[str]:
+    update_fields = []
+    shipping_address = cleaned_input.get("shipping_address")
+    if shipping_address:
+        shipping_address.save()
+        instance.shipping_address = shipping_address
+        update_fields.append("shipping_address")
+    billing_address = cleaned_input.get("billing_address")
+    if billing_address:
+        billing_address.save()
+        instance.billing_address = billing_address
+        update_fields.append("billing_address")
+    return update_fields
+
+
+def update_meta_fields(
+    instance,
+    metadata_collection: metadata_manager.MetadataItemCollection,
+    private_metadata_collection: metadata_manager.MetadataItemCollection,
+):
+    if metadata_collection is not None:
+        items = {data.key: data.value for data in metadata_collection.items}
+        update_metadata(instance, items)
+
+    if private_metadata_collection is not None:
+        items = {data.key: data.value for data in private_metadata_collection.items}
+        update_private_metadata(instance, items)

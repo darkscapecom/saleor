@@ -5,55 +5,21 @@ class AppType:
     CHOICES = [(LOCAL, "local"), (THIRDPARTY, "thirdparty")]
 
 
-class AppExtensionMount:
-    """All places where app extension can be mounted."""
+# Deprecated. Remove this enum in 3.24, when this field is dropped from AppExtension model
+class DeprecatedAppExtensionHttpMethod:
+    """HTTP methods available for app extensions.
 
-    CUSTOMER_OVERVIEW_CREATE = "customer_overview_create"
-    CUSTOMER_OVERVIEW_MORE_ACTIONS = "customer_overview_more_actions"
-    CUSTOMER_DETAILS_MORE_ACTIONS = "customer_details_more_actions"
-
-    PRODUCT_OVERVIEW_CREATE = "product_overview_create"
-    PRODUCT_OVERVIEW_MORE_ACTIONS = "product_overview_more_actions"
-    PRODUCT_DETAILS_MORE_ACTIONS = "product_details_more_actions"
-
-    NAVIGATION_CATALOG = "navigation_catalog"
-    NAVIGATION_ORDERS = "navigation_orders"
-    NAVIGATION_CUSTOMERS = "navigation_customers"
-    NAVIGATION_DISCOUNTS = "navigation_discounts"
-    NAVIGATION_TRANSLATIONS = "navigation_translations"
-    NAVIGATION_PAGES = "navigation_pages"
-
-    ORDER_DETAILS_MORE_ACTIONS = "order_details_more_actions"
-    ORDER_OVERVIEW_CREATE = "order_overview_create"
-    ORDER_OVERVIEW_MORE_ACTIONS = "order_overview_more_actions"
-
-    CHOICES = [
-        (CUSTOMER_OVERVIEW_CREATE, "customer_overview_create"),
-        (CUSTOMER_OVERVIEW_MORE_ACTIONS, "customer_overview_more_actions"),
-        (CUSTOMER_DETAILS_MORE_ACTIONS, "customer_details_more_actions"),
-        (PRODUCT_OVERVIEW_CREATE, "product_overview_create"),
-        (PRODUCT_OVERVIEW_MORE_ACTIONS, "product_overview_more_actions"),
-        (PRODUCT_DETAILS_MORE_ACTIONS, "product_details_more_actions"),
-        (NAVIGATION_CATALOG, "navigation_catalog"),
-        (NAVIGATION_ORDERS, "navigation_orders"),
-        (NAVIGATION_CUSTOMERS, "navigation_customers"),
-        (NAVIGATION_DISCOUNTS, "navigation_discounts"),
-        (NAVIGATION_TRANSLATIONS, "navigation_translations"),
-        (NAVIGATION_PAGES, "navigation_pages"),
-        (ORDER_DETAILS_MORE_ACTIONS, "order_details_more_actions"),
-        (ORDER_OVERVIEW_CREATE, "order_overview_create"),
-        (ORDER_OVERVIEW_MORE_ACTIONS, "order_overview_more_actions"),
-    ]
-
-
-class AppExtensionTarget:
-    """All available ways of opening an app extension.
-
-    POPUP - app's extension will be mounted as a popup window
-    APP_PAGE - redirect to app's page
+    Represents available HTTPS methods for frontend to work with extension (WIDGET and NEW_TAB)
     """
 
-    POPUP = "popup"
-    APP_PAGE = "app_page"
+    GET = "GET"
+    POST = "POST"
 
-    CHOICES = [(POPUP, "popup"), (APP_PAGE, "app_page")]
+    CHOICES = [("GET", "GET"), ("POST", "POST")]
+
+
+# We need special handling for popup - if it declares relative extension URL, resolver will stitch if with app URL
+POPUP_EXTENSION_TARGET = "popup"
+
+# In case of not provided, use the default value as a fallback
+DEFAULT_APP_TARGET = POPUP_EXTENSION_TARGET

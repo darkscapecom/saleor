@@ -11,7 +11,11 @@ from ..core.models import Job, ModelWithMetadata
 from ..permission.enums import AppPermission, BasePermissionEnum
 from ..permission.models import Permission
 from ..webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
-from .types import AppExtensionMount, AppExtensionTarget, AppType
+from .types import (
+    DEFAULT_APP_TARGET,
+    AppType,
+    DeprecatedAppExtensionHttpMethod,
+)
 
 
 class AppQueryset(models.QuerySet["App"]):
@@ -125,7 +129,7 @@ class App(ModelWithMetadata):
 
 
 class AppTokenManager(models.Manager["AppToken"]):
-    def create(self, app, name="", auth_token=None, **extra_fields):
+    def create(self, *, app, name="", auth_token=None, **extra_fields):  # type: ignore[override]
         """Create an app token with the given name."""
         if not auth_token:
             auth_token = generate_token()
@@ -133,11 +137,6 @@ class AppTokenManager(models.Manager["AppToken"]):
         app_token.set_auth_token(auth_token)
         app_token.save()
         return app_token, auth_token
-
-    def create_with_token(self, *args, **kwargs) -> tuple["AppToken", str]:
-        # As `create` is waiting to be fixed, I'm using this proper method from future
-        # to get both AppToken and auth_token.
-        return self.create(*args, **kwargs)
 
 
 class AppToken(models.Model):
@@ -157,17 +156,61 @@ class AppExtension(models.Model):
     app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="extensions")
     label = models.CharField(max_length=256)
     url = models.URLField()
-    mount = models.CharField(choices=AppExtensionMount.CHOICES, max_length=256)
+    mount = models.CharField(max_length=256)
     target = models.CharField(
-        choices=AppExtensionTarget.CHOICES,
         max_length=128,
-        default=AppExtensionTarget.POPUP,
+        default=DEFAULT_APP_TARGET,
     )
     permissions = models.ManyToManyField(
         Permission,
         blank=True,
         help_text="Specific permissions for this app extension.",
     )
+    http_target_method = models.CharField(
+        blank=False,
+        null=True,
+        choices=DeprecatedAppExtensionHttpMethod.CHOICES,
+    )
+    settings = models.JSONField(blank=True, default=dict, db_default={})
+
+
+class AppProblem(models.Model):
+    # Note: When increasing this value, please revise performance. Now dismissing 100 rows is cheap,
+    # but if we increase this number, it can be too heavy and we may need to find more performant way,
+    # e.g. delegate to Celery
+    MAX_PROBLEMS_PER_APP = 100
+
+    app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="problems")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    message = models.CharField(max_length=2048)
+    key = models.CharField(max_length=128)
+    count = models.PositiveIntegerField(default=1)
+    is_critical = models.BooleanField(default=False)
+    dismissed = models.BooleanField(default=False)
+    dismissed_by_user_email = models.EmailField(max_length=256, blank=True, null=True)
+    dismissed_by_user = models.ForeignKey(
+        "account.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    class Meta:
+        ordering = ("-created_at",)
+
+    def is_dismissed_by_user(self) -> bool:
+        """Check if the problem was dismissed by a user (staff).
+
+        Uses the denormalized ``dismissed_by_user_email`` field instead of the
+        ``dismissed_by_user`` FK because the FK is set to NULL when the user is
+        deleted, whereas the email field is preserved indefinitely.
+
+        Method abstracts the fact that we don't store dedicated "by app" or "by user" field,
+        We have only one needed (email) that is enough to deduct this.
+        """
+        return self.dismissed_by_user_email is not None
 
 
 class AppInstallation(Job):

@@ -243,6 +243,44 @@ def test_product_filter_by_categories(
     }
 
 
+def test_product_filter_by_subcategories(
+    api_client, product_list, channel_USD, category_list
+):
+    # given
+    subcategory_1 = category_list[0]
+    subcategory_2 = category_list[1]
+    parent_category = category_list[2]
+
+    subcategory_1.parent = parent_category
+    subcategory_2.parent = parent_category
+    subcategory_1.save()
+    subcategory_2.save()
+
+    product_list[0].category = subcategory_1
+    product_list[1].category = subcategory_2
+    Product.objects.bulk_update(product_list, ["category"])
+
+    category_id = graphene.Node.to_global_id("Category", parent_category.pk)
+
+    variables = {
+        "channel": channel_USD.slug,
+        "where": {"category": {"eq": category_id}},
+    }
+
+    # when
+    response = api_client.post_graphql(PRODUCTS_WHERE_QUERY, variables)
+
+    # then
+    data = get_graphql_content(response)
+    products = data["data"]["products"]["edges"]
+    assert len(products) == 2
+    returned_slugs = {node["node"]["slug"] for node in products}
+    assert returned_slugs == {
+        product_list[0].slug,
+        product_list[1].slug,
+    }
+
+
 def test_product_filter_by_category(
     api_client, product_list, channel_USD, category_list
 ):
@@ -650,7 +688,7 @@ def test_product_filter_by_minimal_price(
     assert returned_slugs == {product_list[index].slug for index in indexes}
 
 
-def test_products_filter_by_attributes(
+def test_products_filter_by_attributes_value_slug(
     api_client,
     product_list,
     channel_USD,
@@ -668,12 +706,21 @@ def test_products_filter_by_attributes(
     attr_value = AttributeValue.objects.create(
         attribute=attribute, name="First", slug="first"
     )
-    product = product_list[0]
-    product.product_type = product_type
-    product.save()
+    # Associate the same attribute value to two products
+    product1 = product_list[0]
+    product1.product_type = product_type
+    product1.save()
     associate_attribute_values_to_instance(
-        product,
-        {attribute.id: [attr_value]},
+        product1,
+        {attribute.pk: [attr_value]},
+    )
+
+    product2 = product_list[1]
+    product2.product_type = product_type
+    product2.save()
+    associate_attribute_values_to_instance(
+        product2,
+        {attribute.pk: [attr_value]},
     )
 
     variables = {
@@ -688,12 +735,13 @@ def test_products_filter_by_attributes(
     content = get_graphql_content(response)
 
     # then
-    product_id = graphene.Node.to_global_id("Product", product.id)
+    product1_id = graphene.Node.to_global_id("Product", product1.id)
+    product2_id = graphene.Node.to_global_id("Product", product2.id)
     products = content["data"]["products"]["edges"]
 
-    assert len(products) == 1
-    assert products[0]["node"]["id"] == product_id
-    assert products[0]["node"]["name"] == product.name
+    assert len(products) == 2
+    returned_ids = {product["node"]["id"] for product in products}
+    assert returned_ids == {product1_id, product2_id}
 
 
 def test_products_filter_by_attributes_empty_list(
@@ -719,7 +767,7 @@ def test_products_filter_by_attributes_empty_list(
     product.save()
     associate_attribute_values_to_instance(
         product,
-        {attribute.id: [attr_value]},
+        {attribute.pk: [attr_value]},
     )
 
     variables = {
@@ -779,7 +827,7 @@ def test_products_filter_by_numeric_attributes(
 
     product_list[1].product_type = product_type
     attr_value = AttributeValue.objects.create(
-        attribute=numeric_attribute, name="5", slug="5"
+        attribute=numeric_attribute, name="5", slug="5", numeric=5.0
     )
     associate_attribute_values_to_instance(
         product_list[1],
@@ -787,7 +835,7 @@ def test_products_filter_by_numeric_attributes(
     )
 
     attr_value = AttributeValue.objects.create(
-        attribute=numeric_attribute, name="5", slug="5_X"
+        attribute=numeric_attribute, name="5", slug="5_X", numeric=5.0
     )
     product_list[2].product_type = product_type
     associate_attribute_values_to_instance(
@@ -892,7 +940,7 @@ def test_products_filter_by_attributes_values_and_range(
 
     product_list[1].product_type = product_type
     attr_value_2 = AttributeValue.objects.create(
-        attribute=numeric_attribute, name="1.2", slug="1_2"
+        attribute=numeric_attribute, name="1.2", slug="1_2", numeric=1.2
     )
     associate_attribute_values_to_instance(
         product_list[1],
@@ -1337,7 +1385,9 @@ def test_products_filter_by_stock_availability(
     assert returned_slugs == {product_list[index].slug for index in indexes}
 
 
+@pytest.mark.parametrize("include_shipping_zones", [True, False])
 def test_products_filter_by_stock_availability_including_reservations(
+    include_shipping_zones,
     api_client,
     product_list,
     order_line,
@@ -1345,8 +1395,12 @@ def test_products_filter_by_stock_availability_including_reservations(
     channel_USD,
     warehouse_JPY,
     stock,
+    site_settings,
 ):
     # given
+    site_settings.use_legacy_shipping_zone_stock_availability = include_shipping_zones
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
     stocks = [product.variants.first().stocks.first() for product in product_list]
     stock.quantity = 50
     stock.product_variant = stocks[2].product_variant
@@ -1395,13 +1449,19 @@ def test_products_filter_by_stock_availability_including_reservations(
     )
 
 
+@pytest.mark.parametrize("include_shipping_zones", [True, False])
 def test_products_filter_by_stock_availability_as_user(
+    include_shipping_zones,
     user_api_client,
     product_list,
     order_line,
     channel_USD,
+    site_settings,
 ):
     # given
+    site_settings.use_legacy_shipping_zone_stock_availability = include_shipping_zones
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
     for product in product_list:
         stock = product.variants.first().stocks.first()
         Allocation.objects.create(
@@ -1457,14 +1517,48 @@ def test_products_filter_by_stock_availability_channel_without_shipping_zones(
     assert products[0]["node"]["id"] == product_id
 
 
+def test_products_filter_by_stock_availability_channel_without_shipping_zones_excluded_from_stock_calculations(
+    api_client,
+    product,
+    channel_USD,
+    site_settings,
+):
+    # given
+    site_settings.use_legacy_shipping_zone_stock_availability = False
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
+    channel_USD.shipping_zones.clear()
+    variables = {
+        "where": {"stockAvailability": "IN_STOCK"},
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = api_client.post_graphql(PRODUCTS_WHERE_QUERY, variables)
+    content = get_graphql_content(response)
+
+    # then - with flag disabled, product is still in stock despite no shipping zones
+    products = content["data"]["products"]["edges"]
+    product_id = graphene.Node.to_global_id("Product", product.id)
+
+    assert len(products) == 1
+    assert products[0]["node"]["id"] == product_id
+
+
+@pytest.mark.parametrize("include_shipping_zones", [True, False])
 def test_products_filter_by_stock_availability_only_stock_in_cc_warehouse(
+    include_shipping_zones,
     api_client,
     product,
     order_line,
     channel_USD,
     warehouse_for_cc,
+    site_settings,
 ):
     # given
+    site_settings.use_legacy_shipping_zone_stock_availability = include_shipping_zones
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
     variant = product.variants.first()
     variant.stocks.all().delete()
 
@@ -1489,6 +1583,46 @@ def test_products_filter_by_stock_availability_only_stock_in_cc_warehouse(
     assert products[0]["node"]["id"] == graphene.Node.to_global_id(
         "Product", product.id
     )
+
+
+def test_products_filter_by_stock_availability_as_user_shipping_zones_excluded_from_stock_calculations(
+    user_api_client,
+    product_list,
+    order_line,
+    channel_USD,
+    site_settings,
+):
+    # given
+    site_settings.use_legacy_shipping_zone_stock_availability = False
+    site_settings.save(update_fields=["use_legacy_shipping_zone_stock_availability"])
+
+    for product in product_list:
+        stock = product.variants.first().stocks.first()
+        Allocation.objects.create(
+            order_line=order_line, stock=stock, quantity_allocated=stock.quantity
+        )
+    product = product_list[0]
+    product.variants.first().channel_listings.filter(channel=channel_USD).update(
+        price_amount=None
+    )
+    variables = {
+        "where": {"stockAvailability": "OUT_OF_STOCK"},
+        "channel": channel_USD.slug,
+    }
+
+    # when
+    response = user_api_client.post_graphql(PRODUCTS_WHERE_QUERY, variables)
+    content = get_graphql_content(response)
+
+    # then - same result as with flag enabled: allocations make products out of stock
+    product_id = graphene.Node.to_global_id("Product", product_list[1].id)
+    second_product_id = graphene.Node.to_global_id("Product", product_list[2].id)
+
+    products = content["data"]["products"]["edges"]
+
+    assert len(products) == 2
+    assert products[0]["node"]["id"] == product_id
+    assert products[1]["node"]["id"] == second_product_id
 
 
 @pytest.mark.parametrize(

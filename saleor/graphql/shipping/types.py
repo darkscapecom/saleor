@@ -9,12 +9,15 @@ from ...product import models as product_models
 from ...shipping import models
 from ...shipping.interface import ShippingMethodData
 from ..account.enums import CountryCodeEnum
-from ..channel import ChannelQsContext
-from ..channel.dataloaders import ChannelByIdLoader
-from ..channel.types import Channel, ChannelContext, ChannelContextType
+from ..channel.dataloaders.by_self import ChannelByIdLoader
+from ..channel.types import Channel
 from ..core.connection import CountableConnection, create_connection_slice
-from ..core.context import get_database_connection_name
-from ..core.descriptions import DEPRECATED_IN_3X_FIELD, RICH_CONTENT
+from ..core.context import (
+    ChannelContext,
+    ChannelQsContext,
+    get_database_connection_name,
+)
+from ..core.descriptions import DEFAULT_DEPRECATION_REASON, RICH_CONTENT
 from ..core.doc_category import DOC_CATEGORY_SHIPPING
 from ..core.fields import ConnectionField, JSONString, PermissionsField
 from ..core.tracing import traced_resolver
@@ -27,6 +30,7 @@ from ..core.types import (
     NonNullList,
     Weight,
 )
+from ..core.types.context import ChannelContextType
 from ..meta.types import ObjectWithMetadata
 from ..shipping.resolvers import resolve_price_range, resolve_shipping_translation
 from ..tax.dataloaders import TaxClassByIdLoader
@@ -347,7 +351,7 @@ class ShippingMethod(BaseObjectType):
     )
     type = ShippingMethodTypeEnum(
         description="Type of the shipping method.",
-        deprecation_reason=DEPRECATED_IN_3X_FIELD,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     name = graphene.String(required=True, description="Shipping method name.")
     description = JSONString(description="Shipping method description." + RICH_CONTENT)
@@ -360,12 +364,12 @@ class ShippingMethod(BaseObjectType):
     maximum_order_weight = graphene.Field(
         Weight,
         description="Maximum order weight for this shipping method.",
-        deprecation_reason=DEPRECATED_IN_3X_FIELD,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     minimum_order_weight = graphene.Field(
         Weight,
         description="Minimum order weight for this shipping method.",
-        deprecation_reason=DEPRECATED_IN_3X_FIELD,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     translation = TranslationField(
         ShippingMethodTranslation,
@@ -376,10 +380,14 @@ class ShippingMethod(BaseObjectType):
         Money, required=True, description="The price of selected shipping method."
     )
     maximum_order_price = graphene.Field(
-        Money, description="Maximum order price for this shipping method."
+        Money,
+        description="Maximum order price for this shipping method.",
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     minimum_order_price = graphene.Field(
-        Money, description="Minimal order price for this shipping method."
+        Money,
+        description="Minimal order price for this shipping method.",
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     active = graphene.Boolean(
         required=True,

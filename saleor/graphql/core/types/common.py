@@ -26,10 +26,7 @@ from ...core.doc_category import (
     DOC_CATEGORY_WEBHOOKS,
 )
 from ...core.scalars import DateTime, Decimal
-from ..descriptions import (
-    ADDED_IN_318,
-    DEPRECATED_IN_3X_FIELD,
-)
+from ..descriptions import ADDED_IN_318
 from ..enums import (
     AccountErrorCode,
     AppErrorCode,
@@ -42,6 +39,7 @@ from ..enums import (
     CheckoutErrorCode,
     CollectionErrorCode,
     CustomerBulkUpdateErrorCode,
+    DeliveryOptionsCalculateErrorCode,
     DiscountErrorCode,
     ExportErrorCode,
     ExternalNotificationTriggerErrorCode,
@@ -71,6 +69,7 @@ from ..enums import (
     ProductTranslateErrorCode,
     ProductVariantBulkErrorCode,
     ProductVariantTranslateErrorCode,
+    RefundSettingsErrorCode,
     SendConfirmationEmailErrorCode,
     ShippingErrorCode,
     ShopErrorCode,
@@ -120,10 +119,7 @@ class NonNullList(graphene.List):
 class SecureGlobalID(graphene.GlobalID):
     @staticmethod
     def id_resolver(parent_resolver, node, root, info, parent_type_name=None, **args):
-        if (
-            hasattr(root, "RETURN_ID_IN_API_RESPONSE")
-            and not root.RETURN_ID_IN_API_RESPONSE
-        ):
+        if hasattr(root, "NEWLY_CREATED_USER") and root.NEWLY_CREATED_USER:
             return ""
         return graphene.GlobalID.id_resolver(
             parent_resolver, node, root, info, parent_type_name, **args
@@ -136,10 +132,7 @@ class CountryDisplay(graphene.ObjectType):
     vat = graphene.Field(
         VAT,
         description="Country tax.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Always returns `null`. Use `TaxClassCountryRate`"
-            " type to manage tax rates per country."
-        ),
+        deprecation_reason="Always returns `null`. Use `TaxClassCountryRate` type to manage tax rates per country.",
     )
 
 
@@ -191,7 +184,7 @@ class BulkError(BaseObjectType):
 
 class AccountError(Error):
     code = AccountErrorCode(description="The error code.", required=True)
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 
@@ -276,7 +269,7 @@ class CheckoutError(Error):
         description="List of line Ids which cause the error.",
         required=False,
     )
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 
@@ -361,6 +354,24 @@ class GiftCardSettingsError(Error):
         doc_category = DOC_CATEGORY_GIFT_CARDS
 
 
+class RefundSettingsUpdateError(Error):
+    code = RefundSettingsErrorCode(
+        description="Failed to update Refund Settings", required=True
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_SHOP
+
+
+class RefundReasonReferenceTypeClearError(Error):
+    code = RefundSettingsErrorCode(
+        description="Failed to clear refund reason reference type", required=True
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_SHOP
+
+
 class MetadataError(Error):
     code = MetadataErrorCode(description="The error code.", required=True)
 
@@ -381,7 +392,7 @@ class OrderError(Error):
         description="List of product variants that are associated with the error",
         required=False,
     )
-    address_type = AddressTypeEnum(  # type: ignore[has-type]
+    address_type = AddressTypeEnum(
         description="A type of address that causes the error.", required=False
     )
 
@@ -598,6 +609,15 @@ class ShippingError(Error):
         graphene.ID,
         description="List of channels IDs which causes the error.",
         required=False,
+    )
+
+    class Meta:
+        doc_category = DOC_CATEGORY_SHIPPING
+
+
+class DeliveryOptionsCalculateError(Error):
+    code = DeliveryOptionsCalculateErrorCode(
+        description="The error code.", required=True
     )
 
     class Meta:

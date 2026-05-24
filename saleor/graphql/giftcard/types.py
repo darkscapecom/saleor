@@ -8,7 +8,12 @@ from ...core.anonymize import obfuscate_email
 from ...core.exceptions import PermissionDenied
 from ...giftcard import GiftCardEvents, models
 from ...permission.auth_filters import AuthorizationFilters
-from ...permission.enums import AccountPermissions, AppPermission, GiftcardPermissions
+from ...permission.enums import (
+    AccountPermissions,
+    AppPermission,
+    GiftcardPermissions,
+    OrderPermissions,
+)
 from ..account.dataloaders import UserByUserIdLoader
 from ..account.utils import (
     check_is_owner_or_has_one_of_perms,
@@ -16,11 +21,10 @@ from ..account.utils import (
 )
 from ..app.dataloaders import AppByIdLoader
 from ..app.types import App
-from ..channel import ChannelContext
-from ..channel.dataloaders import ChannelByIdLoader
+from ..channel.dataloaders.by_self import ChannelByIdLoader
 from ..core.connection import CountableConnection
-from ..core.context import get_database_connection_name
-from ..core.descriptions import DEPRECATED_IN_3X_FIELD
+from ..core.context import ChannelContext, get_database_connection_name
+from ..core.descriptions import DEFAULT_DEPRECATION_REASON
 from ..core.doc_category import DOC_CATEGORY_GIFT_CARDS
 from ..core.fields import PermissionsField
 from ..core.scalars import Date, DateTime
@@ -268,7 +272,7 @@ class GiftCard(ModelObjectType[models.GiftCard]):
     used_by = graphene.Field(
         "saleor.graphql.account.types.User",
         description="The customer who used a gift card.",
-        deprecation_reason=DEPRECATED_IN_3X_FIELD,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     created_by_email = graphene.String(
         required=False,
@@ -282,7 +286,7 @@ class GiftCard(ModelObjectType[models.GiftCard]):
     used_by_email = graphene.String(
         required=False,
         description="Email address of the customer who used a gift card.",
-        deprecation_reason=DEPRECATED_IN_3X_FIELD,
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
     last_used_on = DateTime(description="Date and time when gift card was last used.")
     expiry_date = Date(description="Expiry date of the gift card.")
@@ -303,10 +307,18 @@ class GiftCard(ModelObjectType[models.GiftCard]):
         filter=GiftCardEventFilterInput(
             description="Filtering options for gift card events."
         ),
-        description="List of events associated with the gift card.",
+        description=(
+            "List of events associated with the gift card. Requires "
+            f"{GiftcardPermissions.MANAGE_GIFT_CARD.name} permission to access all "
+            "events. Users with "
+            f"{OrderPermissions.MANAGE_ORDERS.name} permission can access only "
+            f"{GiftCardEvents.USED_IN_ORDER.upper()} and "
+            f"{GiftCardEvents.REFUNDED_IN_ORDER.upper()} events."
+        ),
         required=True,
         permissions=[
             GiftcardPermissions.MANAGE_GIFT_CARD,
+            OrderPermissions.MANAGE_ORDERS,
         ],
     )
     tags = PermissionsField(
@@ -329,15 +341,15 @@ class GiftCard(ModelObjectType[models.GiftCard]):
     user = graphene.Field(
         "saleor.graphql.account.types.User",
         description="The customer who bought a gift card.",
-        deprecation_reason=f"{DEPRECATED_IN_3X_FIELD} Use `createdBy` field instead.",
+        deprecation_reason="Use `createdBy` field instead.",
     )
     end_date = DateTime(
         description="End date of gift card.",
-        deprecation_reason=f"{DEPRECATED_IN_3X_FIELD} Use `expiryDate` field instead.",
+        deprecation_reason="Use `expiryDate` field instead.",
     )
     start_date = DateTime(
         description="Start date of gift card.",
-        deprecation_reason=f"{DEPRECATED_IN_3X_FIELD}",
+        deprecation_reason=DEFAULT_DEPRECATION_REASON,
     )
 
     class Meta:
@@ -479,6 +491,18 @@ class GiftCard(ModelObjectType[models.GiftCard]):
     @staticmethod
     def resolve_events(root: models.GiftCard, info, **kwargs):
         def filter_events(events):
+            requestor = get_user_or_app_from_context(info.context)
+            has_manage_gift_card = requestor and requestor.has_perm(
+                GiftcardPermissions.MANAGE_GIFT_CARD
+            )
+            if not has_manage_gift_card:
+                events = [
+                    event
+                    for event in events
+                    if event.type
+                    in [GiftCardEvents.USED_IN_ORDER, GiftCardEvents.REFUNDED_IN_ORDER]
+                ]
+
             event_filter = kwargs.get("filter", {})
             if event_type_value := event_filter.get("type"):
                 events = filter_events_by_type(events, event_type_value)

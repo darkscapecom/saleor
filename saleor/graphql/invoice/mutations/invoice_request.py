@@ -5,12 +5,13 @@ from ....core import JobStatus
 from ....invoice import events, models
 from ....invoice.error_codes import InvoiceErrorCode
 from ....order import events as order_events
+from ....order.search import update_order_search_vector
 from ....permission.enums import OrderPermissions
 from ....webhook.event_types import WebhookEventAsyncType
 from ...app.dataloaders import get_app_promise
 from ...core import ResolveInfo
 from ...core.context import SyncWebhookControlContext
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.types import InvoiceError
 from ...core.utils import WebhookEventInfo
 from ...order.types import Order
@@ -18,7 +19,7 @@ from ...plugins.dataloaders import get_plugin_manager_promise
 from ..types import Invoice
 
 
-class InvoiceRequest(ModelMutation):
+class InvoiceRequest(DeprecatedModelMutation):
     order = graphene.Field(Order, description="Order related to an invoice.")
 
     class Meta:
@@ -109,6 +110,7 @@ class InvoiceRequest(ModelMutation):
                 user=info.context.user, app=app, order=order
             )
 
+        update_order_search_vector(order)
         events.invoice_requested_event(
             user=info.context.user,
             app=app,

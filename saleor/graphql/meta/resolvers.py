@@ -1,6 +1,8 @@
 import dataclasses
 from operator import itemgetter
 
+from django.db import models
+
 from ...account import models as account_models
 from ...app import models as app_models
 from ...attribute import models as attribute_models
@@ -47,7 +49,7 @@ def resolve_object_with_metadata_type(instance):
     from ..tax import types as tax_types
     from ..warehouse import types as warehouse_types
 
-    MODEL_TO_TYPE_MAP = {
+    MODEL_TO_TYPE_MAP: dict[type, type[models.Model]] = {
         account_models.Address: account_types.Address,
         account_models.User: account_types.User,
         app_models.App: app_types.App,
@@ -71,7 +73,6 @@ def resolve_object_with_metadata_type(instance):
         payment_models.TransactionItem: payment_types.TransactionItem,
         product_models.Category: product_types.Category,
         product_models.Collection: product_types.Collection,
-        product_models.DigitalContent: product_types.DigitalContent,
         product_models.Product: product_types.Product,
         product_models.ProductMedia: product_types.ProductMedia,
         product_models.ProductType: product_types.ProductType,
@@ -89,11 +90,20 @@ def resolve_object_with_metadata_type(instance):
             instance, "old_sale_id", False
         ):
             return discount_types.Sale, instance.pk
-        return MODEL_TO_TYPE_MAP.get(instance.__class__, None), instance.pk
+        if instance.__class__ not in MODEL_TO_TYPE_MAP:
+            raise ValueError(f"Unknown type: {instance.__class__}")
+        return MODEL_TO_TYPE_MAP[instance.__class__], instance.pk
 
     if dataclasses.is_dataclass(instance):
-        DATACLASS_TO_TYPE_MAP = {ShippingMethodData: shipping_types.ShippingMethod}
-        return DATACLASS_TO_TYPE_MAP.get(instance.__class__, None), instance.id
+        DATACLASS_TO_TYPE_MAP: dict[type, type[models.Model]] = {
+            ShippingMethodData: shipping_types.ShippingMethod
+        }
+        if isinstance(instance, type):
+            raise ValueError(f"Unknown type: {instance}")
+        if instance.__class__ not in DATACLASS_TO_TYPE_MAP:
+            raise ValueError(f"Unknown type: {instance.__class__}")
+        return DATACLASS_TO_TYPE_MAP[instance.__class__], instance.id  # type: ignore[attr-defined]
+
     raise ValueError(f"Unknown type: {instance.__class__}")
 
 

@@ -3,7 +3,7 @@ import graphene
 from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ..core.descriptions import (
     ADDED_IN_318,
-    DEPRECATED_IN_3X_ENUM_VALUE,
+    DEFAULT_DEPRECATION_REASON,
 )
 from ..core.doc_category import DOC_CATEGORY_WEBHOOKS
 from ..core.types import BaseEnum
@@ -26,7 +26,18 @@ order_updated_event_enum_description = (
     "An order is updated; triggered for all changes related to an order; "
     "covers all other order webhooks, except for ORDER_CREATED."
 )
-
+checkout_fully_authorized_event_enum_description = (
+    "A checkout was fully authorized (its `authorizeStatus` is `FULL`)."
+    "\n\nThis event is emitted only for checkouts whose payments are "
+    "processed through the Transaction API."
+)
+checkout_fully_paid_event_enum_description = (
+    "A checkout was fully paid (its `chargeStatus` is `FULL` "
+    "or `OVERCHARGED`). This event is not sent if payments are only authorized "
+    "but not fully charged."
+    "\n\nThis event is emitted only for checkouts whose payments are processed"
+    " through the Transaction API."
+)
 
 WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.ACCOUNT_CONFIRMATION_REQUESTED: (
@@ -65,6 +76,8 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.CHANNEL_METADATA_UPDATED: "A channel metadata is updated.",
     WebhookEventAsyncType.CHECKOUT_CREATED: "A new checkout is created.",
     WebhookEventAsyncType.CHECKOUT_UPDATED: checkout_updated_event_enum_description,
+    WebhookEventAsyncType.CHECKOUT_FULLY_AUTHORIZED: checkout_fully_authorized_event_enum_description,
+    WebhookEventAsyncType.CHECKOUT_FULLY_PAID: checkout_fully_paid_event_enum_description,
     WebhookEventAsyncType.CHECKOUT_METADATA_UPDATED: "A checkout metadata is updated.",
     WebhookEventAsyncType.COLLECTION_CREATED: "A new collection is created.",
     WebhookEventAsyncType.COLLECTION_UPDATED: "A collection is updated.",
@@ -90,13 +103,7 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.MENU_ITEM_CREATED: "A new menu item created.",
     WebhookEventAsyncType.MENU_ITEM_UPDATED: "A menu item is updated.",
     WebhookEventAsyncType.MENU_ITEM_DELETED: "A menu item is deleted.",
-    WebhookEventAsyncType.NOTIFY_USER: (
-        "User notification triggered."
-        + DEPRECATED_IN_3X_ENUM_VALUE
-        + " See the docs for more details about migrating from NOTIFY_USER to other "
-        "events: "
-        + "https://docs.saleor.io/docs/next/upgrade-guides/notify-user-deprecation"
-    ),
+    WebhookEventAsyncType.NOTIFY_USER: "User notification triggered.",
     WebhookEventAsyncType.ORDER_CREATED: "A new order is placed.",
     WebhookEventAsyncType.ORDER_CONFIRMED: order_confirmed_event_enum_description,
     WebhookEventAsyncType.ORDER_PAID: (
@@ -106,12 +113,12 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.ORDER_REFUNDED: (
         "The order received a refund. The order may be partially or fully refunded."
     ),
-    WebhookEventAsyncType.ORDER_FULLY_REFUNDED: ("The order is fully refunded."),
+    WebhookEventAsyncType.ORDER_FULLY_REFUNDED: "The order is fully refunded.",
     WebhookEventAsyncType.ORDER_UPDATED: order_updated_event_enum_description,
     WebhookEventAsyncType.ORDER_CANCELLED: "An order is cancelled.",
     WebhookEventAsyncType.ORDER_EXPIRED: "An order is expired.",
     WebhookEventAsyncType.ORDER_FULFILLED: "An order is fulfilled.",
-    WebhookEventAsyncType.ORDER_METADATA_UPDATED: ("An order metadata is updated."),
+    WebhookEventAsyncType.ORDER_METADATA_UPDATED: "An order metadata is updated.",
     WebhookEventAsyncType.ORDER_BULK_CREATED: "Orders are imported.",
     WebhookEventAsyncType.DRAFT_ORDER_CREATED: "A draft order is created.",
     WebhookEventAsyncType.DRAFT_ORDER_UPDATED: "A draft order is updated.",
@@ -148,7 +155,7 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.PRODUCT_CREATED: "A new product is created.",
     WebhookEventAsyncType.PRODUCT_UPDATED: "A product is updated.",
     WebhookEventAsyncType.PRODUCT_DELETED: "A product is deleted.",
-    WebhookEventAsyncType.PRODUCT_METADATA_UPDATED: ("A product metadata is updated."),
+    WebhookEventAsyncType.PRODUCT_METADATA_UPDATED: "A product metadata is updated.",
     WebhookEventAsyncType.PRODUCT_MEDIA_CREATED: "A new product media is created.",
     WebhookEventAsyncType.PRODUCT_MEDIA_UPDATED: "A product media is updated.",
     WebhookEventAsyncType.PRODUCT_MEDIA_DELETED: "A product media is deleted.",
@@ -167,7 +174,31 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.PRODUCT_VARIANT_STOCK_UPDATED: (
         "A product variant stock is updated"
     ),
-    WebhookEventAsyncType.PRODUCT_EXPORT_COMPLETED: ("A product export is completed."),
+    WebhookEventAsyncType.PRODUCT_VARIANT_OUT_OF_STOCK_IN_CHANNEL: (
+        "A product variant becomes out of stock across all non click-and-collect "
+        "warehouses in a channel. "
+        "\n\nNote: Only triggered when the `useLegacyShippingZoneStockAvailability` "
+        "shop setting is disabled."
+    ),
+    WebhookEventAsyncType.PRODUCT_VARIANT_BACK_IN_STOCK_IN_CHANNEL: (
+        "A product variant becomes available again across non click-and-collect "
+        "warehouses in a channel. "
+        "\n\nNote: Only triggered when the `useLegacyShippingZoneStockAvailability` "
+        "shop setting is disabled."
+    ),
+    WebhookEventAsyncType.PRODUCT_VARIANT_OUT_OF_STOCK_FOR_CLICK_AND_COLLECT: (
+        "A product variant becomes out of stock across all click-and-collect "
+        "warehouses in a channel. "
+        "\n\nNote: Only triggered when the `useLegacyShippingZoneStockAvailability` "
+        "shop setting is disabled."
+    ),
+    WebhookEventAsyncType.PRODUCT_VARIANT_BACK_IN_STOCK_FOR_CLICK_AND_COLLECT: (
+        "A product variant becomes available again across click-and-collect "
+        "warehouses in a channel. "
+        "\n\nNote: Only triggered when the `useLegacyShippingZoneStockAvailability` "
+        "shop setting is disabled."
+    ),
+    WebhookEventAsyncType.PRODUCT_EXPORT_COMPLETED: "A product export is completed.",
     WebhookEventAsyncType.SHIPPING_PRICE_CREATED: "A new shipping price is created.",
     WebhookEventAsyncType.SHIPPING_PRICE_UPDATED: "A shipping price is updated.",
     WebhookEventAsyncType.SHIPPING_PRICE_DELETED: "A shipping price is deleted.",
@@ -197,11 +228,11 @@ WEBHOOK_EVENT_DESCRIPTION = {
     WebhookEventAsyncType.VOUCHER_CREATED: "A new voucher created.",
     WebhookEventAsyncType.VOUCHER_UPDATED: "A voucher is updated.",
     WebhookEventAsyncType.VOUCHER_DELETED: "A voucher is deleted.",
-    WebhookEventAsyncType.VOUCHER_METADATA_UPDATED: ("A voucher metadata is updated."),
+    WebhookEventAsyncType.VOUCHER_METADATA_UPDATED: "A voucher metadata is updated.",
     WebhookEventAsyncType.VOUCHER_CODE_EXPORT_COMPLETED: (
         "A voucher code export is completed." + ADDED_IN_318
     ),
-    WebhookEventAsyncType.ANY: "All the events." + DEPRECATED_IN_3X_ENUM_VALUE,
+    WebhookEventAsyncType.ANY: "All the events.",
     WebhookEventAsyncType.OBSERVABILITY: "An observability event is created.",
     WebhookEventAsyncType.THUMBNAIL_CREATED: "A thumbnail is created.",
     WebhookEventAsyncType.SHOP_METADATA_UPDATED: "Shop metadata is updated.",
@@ -245,6 +276,17 @@ def description(enum):
     return "Enum determining type of webhook."
 
 
+def deprecation_reason(enum):
+    if enum.value == WebhookEventAsyncType.NOTIFY_USER:
+        return (
+            "See the docs for more details about migrating from NOTIFY_USER to other events: "
+            "https://docs.saleor.io/upgrade-guides/core/3-16-to-3-17#migrating-from-notify_user"
+        )
+    if enum.value == WebhookEventAsyncType.ANY:
+        return DEFAULT_DEPRECATION_REASON
+    return None
+
+
 WebhookEventTypeEnum = graphene.Enum(
     "WebhookEventTypeEnum",
     [
@@ -252,6 +294,7 @@ WebhookEventTypeEnum = graphene.Enum(
         for e_type in (WebhookEventAsyncType.CHOICES + WebhookEventSyncType.CHOICES)
     ],
     description=description,
+    deprecation_reason=deprecation_reason,
 )
 WebhookEventTypeEnum.doc_category = DOC_CATEGORY_WEBHOOKS
 
@@ -260,6 +303,7 @@ WebhookEventTypeAsyncEnum = graphene.Enum(
     "WebhookEventTypeAsyncEnum",
     [(str_to_enum(e_type[0]), e_type[0]) for e_type in WebhookEventAsyncType.CHOICES],
     description=description,
+    deprecation_reason=deprecation_reason,
 )
 WebhookEventTypeAsyncEnum.doc_category = DOC_CATEGORY_WEBHOOKS
 
@@ -267,6 +311,7 @@ WebhookEventTypeSyncEnum = graphene.Enum(
     "WebhookEventTypeSyncEnum",
     [(str_to_enum(e_type[0]), e_type[0]) for e_type in WebhookEventSyncType.CHOICES],
     description=description,
+    deprecation_reason=deprecation_reason,
 )
 WebhookEventTypeSyncEnum.doc_category = DOC_CATEGORY_WEBHOOKS
 

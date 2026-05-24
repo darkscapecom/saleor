@@ -7,13 +7,11 @@ from ...permission.enums import OrderPermissions, ProductPermissions
 from ...warehouse import models
 from ...warehouse.reservations import is_reservation_enabled
 from ..account.dataloaders import AddressByIdLoader
-from ..channel import ChannelContext
 from ..core import ResolveInfo
 from ..core.connection import CountableConnection, create_connection_slice
-from ..core.context import get_database_connection_name
+from ..core.context import ChannelContext, get_database_connection_name
 from ..core.descriptions import (
     ADDED_IN_320,
-    DEPRECATED_IN_3X_FIELD,
     DEPRECATED_IN_3X_INPUT,
 )
 from ..core.doc_category import DOC_CATEGORY_PRODUCTS
@@ -68,7 +66,7 @@ class WarehouseUpdateInput(WarehouseInput):
         required=False,
     )
     click_and_collect_option = WarehouseClickAndCollectOptionEnum(
-        description=("Click and collect options: local, all or disabled."),
+        description="Click and collect options: local, all or disabled.",
         required=False,
     )
     is_private = graphene.Boolean(
@@ -96,9 +94,7 @@ class Warehouse(ModelObjectType[models.Warehouse]):
     company_name = graphene.String(
         required=True,
         description="Warehouse company name.",
-        deprecation_reason=(
-            f"{DEPRECATED_IN_3X_FIELD} Use `Address.companyName` instead."
-        ),
+        deprecation_reason="Use `Address.companyName` instead.",
     )
     click_and_collect_option = WarehouseClickAndCollectOptionEnum(
         description="Click and collect options: local, all or disabled.",

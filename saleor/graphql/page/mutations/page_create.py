@@ -1,19 +1,22 @@
 import datetime
+from typing import cast
 
 import graphene
 from django.core.exceptions import ValidationError
+from django.db.models import QuerySet
 
 from ....core.tracing import traced_atomic_transaction
 from ....page import models
 from ....page.error_codes import PageErrorCode
 from ....permission.enums import PagePermissions
 from ...attribute.types import AttributeValueInput
-from ...attribute.utils import PageAttributeAssignmentMixin
+from ...attribute.utils.attribute_assignment import AttributeAssignmentMixin
 from ...core import ResolveInfo
+from ...core.context import ChannelContext
 from ...core.descriptions import DEPRECATED_IN_3X_INPUT, RICH_CONTENT
 from ...core.doc_category import DOC_CATEGORY_PAGES
 from ...core.fields import JSONString
-from ...core.mutations import ModelMutation
+from ...core.mutations import DeprecatedModelMutation
 from ...core.scalars import DateTime
 from ...core.types import BaseInputObjectType, NonNullList, PageError, SeoInput
 from ...core.validators import clean_seo_fields, validate_slug_and_generate_if_needed
@@ -51,7 +54,7 @@ class PageCreateInput(PageInput):
         doc_category = DOC_CATEGORY_PAGES
 
 
-class PageCreate(ModelMutation):
+class PageCreate(DeprecatedModelMutation):
     class Arguments:
         input = PageCreateInput(
             required=True, description="Fields required to create a page."
@@ -66,9 +69,10 @@ class PageCreate(ModelMutation):
         error_type_field = "page_errors"
 
     @classmethod
-    def clean_attributes(cls, attributes: dict, page_type: models.PageType):
-        attributes_qs = page_type.page_attributes.prefetch_related("values")
-        cleaned_attributes = PageAttributeAssignmentMixin.clean_input(
+    def clean_attributes(cls, attributes: list[dict], page_type: models.PageType):
+        attributes_qs = page_type.page_attributes
+        attributes_qs = cast(QuerySet, attributes_qs)
+        cleaned_attributes = AttributeAssignmentMixin.clean_input(
             attributes, attributes_qs, is_page_attributes=True
         )
         return cleaned_attributes
@@ -127,10 +131,16 @@ class PageCreate(ModelMutation):
 
             attributes = cleaned_data.get("attributes")
             if attributes:
-                PageAttributeAssignmentMixin.save(instance, attributes)
+                AttributeAssignmentMixin.save(instance, attributes)
 
     @classmethod
-    def save(cls, info: ResolveInfo, instance, cleaned_input):
+    def save(cls, info: ResolveInfo, instance, cleaned_input, instance_tracker=None):
         super().save(info, instance, cleaned_input)
         manager = get_plugin_manager_promise(info.context).get()
         cls.call_event(manager.page_created, instance)
+
+    @classmethod
+    def success_response(cls, instance):
+        response = super().success_response(instance)
+        response.page = ChannelContext(instance, channel_slug=None)
+        return response

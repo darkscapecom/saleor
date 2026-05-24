@@ -1,20 +1,52 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
 import graphene
+import graphql.validation
+from babel.numbers import get_currency_precision
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django_prices.utils.formatting import get_currency_fraction
 from graphene.utils.str_converters import to_camel_case
 from graphql.error import GraphQLError
+from graphql.language.ast import Document
+from graphql.type import GraphQLSchema
 
 from ....core.utils import generate_unique_slug
 from ....product.models import ProductVariantChannelListing
+from .alias_count_limit_rule import AliasCountLimitRule
+from .mutation_count_limit_rule import MutationCountLimitRule
+from .query_cost import cost_validator as cost_validation_rule
 
 if TYPE_CHECKING:
     from decimal import Decimal
 
     from django.db.models import Model
+
+
+def validate_query(
+    *,
+    schema: GraphQLSchema,
+    document_ast: Document,
+    variables: dict[str, Any] | None,
+    cost_map: dict[str, Any] | None,
+):
+    cost_validator = cost_validation_rule(
+        maximum_cost=settings.GRAPHQL_QUERY_MAX_COMPLEXITY,
+        variables=variables,
+        cost_map=cost_map,
+    )
+    error = graphql.validation.validate(
+        schema,
+        document_ast,
+        [
+            cost_validator,  # type: ignore[list-item] # cost validator is an instance that pretends to be a class # noqa: E501
+            AliasCountLimitRule,
+            MutationCountLimitRule,
+        ],
+    )
+    if error:
+        return cost_validator.cost, error
+    return cost_validator.cost, None
 
 
 def validate_one_of_args_is_in_mutation(*args, **kwargs):
@@ -76,7 +108,7 @@ def validate_price_precision(
         except KeyError:
             currency_fraction = currency_fractions["DEFAULT"][0]
     else:
-        currency_fraction = get_currency_fraction(currency)
+        currency_fraction = get_currency_precision(currency)
 
     value = value.normalize()
     if value.as_tuple().exponent < -currency_fraction:
@@ -215,3 +247,15 @@ def validate_if_int_or_uuid(id):
             UUID(id)
         except (AttributeError, ValueError) as e:
             raise ValidationError("Must receive an int or UUID.") from e
+
+
+def validate_limit_of_list_input(
+    input_list: list,
+    limit: int,
+    field_name: str,
+):
+    """Validate if the length of the input list does not exceed the limit."""
+    if len(input_list) > limit:
+        raise ValidationError(
+            f"The maximum number of items in {field_name} is {limit}."
+        )

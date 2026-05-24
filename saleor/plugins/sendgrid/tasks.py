@@ -15,7 +15,7 @@ from . import SendgridConfiguration
 
 logger = logging.getLogger(__name__)
 
-CELERY_RETRY_BACKOFF = 60
+CELERY_RETRY_BACKOFF = 30
 CELERY_RETRY_MAX = 5
 
 
@@ -216,14 +216,6 @@ def send_fulfillment_confirmation_email_task(payload: dict, configuration: dict)
             app_id=from_global_id_or_none(payload["requester_app_id"]),
             customer_email=payload["recipient_email"],
         )
-
-        if payload.get("digital_lines"):
-            order_events.event_fulfillment_digital_links_notification(
-                order_id=from_global_id_or_none(payload["order"]["id"]),
-                user_id=from_global_id_or_none(payload["requester_user_id"]),
-                app_id=from_global_id_or_none(payload["requester_app_id"]),
-                customer_email=payload["recipient_email"],
-            )
 
 
 @app.task(

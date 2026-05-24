@@ -22,7 +22,7 @@ from ....webhook.event_types import WebhookEventAsyncType
 from ...account.i18n import I18nMixin
 from ...account.types import AddressInput
 from ...core.context import SyncWebhookControlContext
-from ...core.descriptions import DEPRECATED_IN_3X_INPUT
+from ...core.descriptions import ADDED_IN_321, DEPRECATED_IN_3X_INPUT
 from ...core.doc_category import DOC_CATEGORY_CHECKOUT
 from ...core.mutations import BaseMutation
 from ...core.scalars import UUID
@@ -36,7 +36,7 @@ from .utils import (
     ERROR_CC_ADDRESS_CHANGE_FORBIDDEN,
     check_lines_quantity,
     get_checkout,
-    update_checkout_shipping_method_if_invalid,
+    mark_checkout_deliveries_as_stale_if_needed,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +65,16 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             required=True,
             description="The mailing address to where the checkout will be shipped.",
         )
+        save_address = graphene.Boolean(
+            required=False,
+            default_value=True,
+            description=(
+                "Indicates whether the shipping address should be saved "
+                "to the user’s address book upon checkout completion. "
+                "If not provided, the default behavior is to save the address."
+            )
+            + ADDED_IN_321,
+        )
         validation_rules = CheckoutAddressValidationRules(
             required=False,
             description=(
@@ -73,7 +83,7 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
         )
 
     class Meta:
-        description = "Update shipping address in the existing checkout."
+        description = "Updates shipping address in the existing checkout."
         doc_category = DOC_CATEGORY_CHECKOUT
         error_type_class = CheckoutError
         error_type_field = "checkout_errors"
@@ -111,15 +121,17 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             replace=True,
             existing_lines=lines,
             check_reservations=is_reservation_enabled(site.settings),
+            calculate_stocks_with_shipping_zones=site.settings.use_legacy_shipping_zone_stock_availability,
         )
 
     @classmethod
-    def perform_mutation(
+    def perform_mutation(  # type: ignore[override]
         cls,
         _root,
         info,
         /,
         shipping_address,
+        save_address,
         validation_rules=None,
         checkout_id=None,
         token=None,
@@ -166,10 +178,7 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
             ),
         )
         manager = get_plugin_manager_promise(info.context).get()
-        shipping_channel_listings = checkout.channel.shipping_method_listings.all()
-        checkout_info = fetch_checkout_info(
-            checkout, lines, manager, shipping_channel_listings
-        )
+        checkout_info = fetch_checkout_info(checkout, lines, manager)
 
         country = shipping_address_instance.country.code
         checkout.set_country(country, commit=True)
@@ -184,24 +193,28 @@ class CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixi
                 checkout_info.get_delivery_method_info(),
             )
 
-        update_checkout_shipping_method_if_invalid(checkout_info, lines)
-
         shipping_address_updated_fields = []
         with traced_atomic_transaction():
             shipping_address_instance.save()
             shipping_address_updated_fields = change_shipping_address_in_checkout(
                 checkout_info,
                 shipping_address_instance,
-                lines,
-                manager,
-                shipping_channel_listings,
+                save_address,
             )
+
+        shipping_update_fields = mark_checkout_deliveries_as_stale_if_needed(
+            checkout_info.checkout, lines
+        )
+
         invalidate_prices_updated_fields = invalidate_checkout(
             checkout_info, lines, manager, save=False
         )
+        checkout.search_index_dirty = True
         checkout.save(
             update_fields=shipping_address_updated_fields
             + invalidate_prices_updated_fields
+            + shipping_update_fields
+            + ["search_index_dirty"]
         )
 
         call_checkout_info_event(

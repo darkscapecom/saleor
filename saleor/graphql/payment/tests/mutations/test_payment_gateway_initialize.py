@@ -1,4 +1,5 @@
 import datetime
+import json
 from decimal import Decimal
 from unittest import mock
 
@@ -7,10 +8,12 @@ from django.test import override_settings
 
 from .....checkout.calculations import fetch_checkout_data
 from .....checkout.fetch import fetch_checkout_info, fetch_checkout_lines
+from .....core import EventDeliveryStatus
 from .....payment.interface import PaymentGatewayData
 from .....payment.models import TransactionItem
 from .....plugins.manager import get_plugins_manager
 from .....webhook.event_types import WebhookEventSyncType
+from .....webhook.transport.utils import WebhookResponse
 from ....core.enums import PaymentGatewayConfigErrorCode, TransactionInitializeErrorCode
 from ....core.utils import to_global_id_or_none
 from ....tests.utils import get_graphql_content
@@ -53,16 +56,15 @@ def test_for_checkout_without_payment_gateways(
     checkout = checkout_with_prices
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, plugins_manager)
-    checkout_info, _ = fetch_checkout_data(checkout_info, plugins_manager, lines)
+    checkout_info, _ = fetch_checkout_data(
+        checkout_info, plugins_manager, lines, requestor=user_api_client.user
+    ).get()
     checkout = checkout_info.checkout
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
-    expected_response = {"data": expected_data}
 
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
 
     variables = {"id": to_global_id_or_none(checkout), "paymentGateways": None}
@@ -128,12 +130,9 @@ def test_for_order_without_payment_gateways(
     order = order_with_lines
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
-    expected_response = {"data": expected_data}
 
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
 
     variables = {"id": to_global_id_or_none(order), "paymentGateways": None}
@@ -164,18 +163,17 @@ def test_for_checkout_with_payment_gateways(
     checkout = checkout_with_prices
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, plugins_manager)
-    checkout_info, _ = fetch_checkout_data(checkout_info, plugins_manager, lines)
+    checkout_info, _ = fetch_checkout_data(
+        checkout_info, plugins_manager, lines, requestor=user_api_client.user
+    ).get()
     checkout = checkout_info.checkout
 
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
     expected_input_data = {"input": "json"}
-    expected_response = {"data": expected_data}
 
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
 
     variables = {
@@ -222,12 +220,9 @@ def test_for_order_with_payment_gateways(
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
     expected_input_data = {"input": "json"}
-    expected_response = {"data": expected_data}
 
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
 
     variables = {
@@ -273,14 +268,11 @@ def test_for_checkout_with_payment_gateways_and_amount(
     checkout = checkout_with_prices
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
-    expected_response = {"data": expected_data}
     expected_input_data = {"input": "json"}
     excpected_amount = Decimal(30)
 
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
 
     variables = {
@@ -327,13 +319,10 @@ def test_for_order_with_payment_gateways_and_amount(
     order = order_with_lines
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
-    expected_response = {"data": expected_data}
     expected_input_data = {"input": "json"}
     excpected_amount = Decimal(30)
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
     variables = {
         "id": to_global_id_or_none(order),
@@ -610,7 +599,6 @@ def test_for_checkout_with_multiple_payment_gateways(
     excpected_amount = Decimal(30)
     first_expected_app_identifier = "app.id"
     first_expected_data = {"json": "data"}
-    first_expected_response = {"data": first_expected_data}
     first_expected_input_data = {"input": "json"}
 
     second_expected_input_data = {"input": "json2"}
@@ -626,7 +614,7 @@ def test_for_checkout_with_multiple_payment_gateways(
 
     mocked_initialize.return_value = [
         PaymentGatewayData(
-            app_identifier=first_expected_app_identifier, data=first_expected_response
+            app_identifier=first_expected_app_identifier, data=first_expected_data
         ),
         PaymentGatewayData(
             app_identifier=second_expected_app_identifier, error=second_error_msg
@@ -717,7 +705,6 @@ def test_for_order_with_multiple_payment_gateways(
     excpected_amount = Decimal(30)
     first_expected_app_identifier = "app.id"
     first_expected_data = {"json": "data"}
-    first_expected_response = {"data": first_expected_data}
     first_expected_input_data = {"input": "json"}
 
     second_expected_input_data = {"input": "json2"}
@@ -733,7 +720,7 @@ def test_for_order_with_multiple_payment_gateways(
 
     mocked_initialize.return_value = [
         PaymentGatewayData(
-            app_identifier=first_expected_app_identifier, data=first_expected_response
+            app_identifier=first_expected_app_identifier, data=first_expected_data
         ),
         PaymentGatewayData(
             app_identifier=second_expected_app_identifier, error=second_error_msg
@@ -823,13 +810,10 @@ def test_with_payment_gateways_and_amount_with_lot_of_decimal_places(
     order = order_with_lines
     expected_app_identifier = "app.id"
     expected_data = {"json": "data"}
-    expected_response = {"data": expected_data}
     expected_input_data = {"input": "json"}
     excpected_amount = Decimal("28.1256977854")
     mocked_initialize.return_value = [
-        PaymentGatewayData(
-            app_identifier=expected_app_identifier, data=expected_response
-        )
+        PaymentGatewayData(app_identifier=expected_app_identifier, data=expected_data)
     ]
     variables = {
         "id": to_global_id_or_none(order),
@@ -926,7 +910,9 @@ def test_for_checkout_with_shipping_app(
     checkout = checkout_with_prices
     lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, plugins_manager)
-    checkout_info, _ = fetch_checkout_data(checkout_info, plugins_manager, lines)
+    checkout_info, _ = fetch_checkout_data(
+        checkout_info, plugins_manager, lines, requestor=user_api_client.user
+    ).get()
     checkout = checkout_info.checkout
 
     variables = {
@@ -1013,8 +999,12 @@ def test_for_checkout_with_tax_app(
     manager = get_plugins_manager(allow_replica=False)
     checkout_info = fetch_checkout_info(checkout, lines, manager)
     checkout_info, _ = fetch_checkout_data(
-        checkout_info, manager, lines, force_update=True
-    )
+        checkout_info,
+        manager,
+        lines,
+        requestor=user_api_client.user,
+        force_update=True,
+    ).get()
 
     variables = {
         "id": to_global_id_or_none(checkout),
@@ -1129,3 +1119,117 @@ def test_for_order_with_tax_app(
     for call in mocked_send_webhook_request_sync.mock_calls:
         delivery = call.args[0]
         assert delivery.payload.get_payload()
+
+
+@mock.patch("saleor.webhook.transport.synchronous.transport.send_webhook_using_http")
+@override_settings(PLUGINS=["saleor.plugins.webhook.plugin.WebhookPlugin"])
+def test_with_mutiple_payment_gateways_have_different_recipments(
+    mock_send_webhook_using_http,
+    webhook_app,
+    payment_gateway_initialize_session_app,
+    checkout,
+    permission_manage_payments,
+    user_api_client,
+):
+    # given
+    assert payment_gateway_initialize_session_app.id != webhook_app.id
+
+    mock_response = mock.MagicMock(spec=WebhookResponse)
+    mock_response.response_status_code = 200
+    mock_response.status = EventDeliveryStatus.SUCCESS
+    mock_response.content = "{}"
+    mock_response.duration = 2.0
+    mock_response.response_headers = {}
+    mock_response.request_headers = {}
+    mock_send_webhook_using_http.return_value = mock_response
+
+    subscription_query = """
+    subscription {
+      event{
+        recipient {
+          id
+          identifier
+        }
+        ...on PaymentGatewayInitializeSession{
+          data
+          amount
+          sourceObject{
+            __typename
+            ... on Checkout{
+              email
+              id
+              channel{
+                id
+                slug
+              }
+            }
+            ... on Order{
+              id
+            }
+          }
+        }
+      }
+    }
+    """
+
+    second_subscription_query = """
+    subscription {
+      event{
+        recipient {
+          id
+          identifier
+        }
+        ...on PaymentGatewayInitializeSession{
+          data
+          amount
+          sourceObject{
+            __typename
+            ... on Checkout{
+              email
+              id
+              channel{
+                id
+                slug
+              }
+            }
+            ... on Order{
+              id
+            }
+          }
+        }
+      }
+    }
+    """
+    # Set up first app
+    webhook_initialize_session = payment_gateway_initialize_session_app.webhooks.first()
+    webhook_initialize_session.subscription_query = subscription_query
+    webhook_initialize_session.save(update_fields=["subscription_query"])
+
+    # Set up second app
+    webhook_app.identifier = "app.identifier"
+    webhook_app.save()
+    webhook_app.permissions.add(permission_manage_payments)
+    webhook_app.permissions.add(permission_manage_payments)
+    webhook = webhook_app.webhooks.create(
+        target_url="http://localhost:8001/endpoint/",
+        name="Webhook",
+        app=webhook_app,
+        subscription_query=second_subscription_query,
+    )
+    webhook.events.create(
+        event_type=WebhookEventSyncType.PAYMENT_GATEWAY_INITIALIZE_SESSION
+    )
+
+    variables = {
+        "id": to_global_id_or_none(checkout),
+    }
+
+    # when
+    user_api_client.post_graphql(PAYMENT_GATEWAY_INITIALIZE, variables)
+
+    # then
+    assert mock_send_webhook_using_http.call_count == 2
+    first_message = mock_send_webhook_using_http.mock_calls[0].args[1]
+    second_message = mock_send_webhook_using_http.mock_calls[1].args[1]
+
+    assert json.loads(first_message) != json.loads(second_message)

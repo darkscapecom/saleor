@@ -10,11 +10,10 @@ from .....discount.models import Promotion
 from .....discount.utils.promotion import mark_catalogue_promotion_rules_as_dirty
 from .....permission.enums import DiscountPermissions
 from .....webhook.event_types import WebhookEventAsyncType
-from ....channel import ChannelContext
 from ....core import ResolveInfo
-from ....core.descriptions import DEPRECATED_IN_3X_MUTATION
+from ....core.context import ChannelContext
 from ....core.doc_category import DOC_CATEGORY_DISCOUNTS
-from ....core.mutations import ModelMutation
+from ....core.mutations import DeprecatedModelMutation
 from ....core.scalars import DateTime, PositiveDecimal
 from ....core.types import BaseInputObjectType, DiscountError, NonNullList
 from ....core.utils import WebhookEventInfo
@@ -57,18 +56,14 @@ class SaleInput(BaseInputObjectType):
         doc_category = DOC_CATEGORY_DISCOUNTS
 
 
-class SaleCreate(ModelMutation):
+class SaleCreate(DeprecatedModelMutation):
     class Arguments:
         input = SaleInput(
             required=True, description="Fields required to create a sale."
         )
 
     class Meta:
-        description = (
-            "Creates a new sale."
-            + DEPRECATED_IN_3X_MUTATION
-            + " Use `promotionCreate` mutation instead."
-        )
+        description = "Creates a new sale."
         permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
         model = models.Promotion
         object_type = Sale
