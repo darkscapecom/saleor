@@ -501,9 +501,6 @@ MAX_IMAGE_FILE_SIZE = int(
     os.environ.get("MAX_IMAGE_FILE_SIZE", 10 * 1024 * 1024)
 )  # 10MB
 
-TEST_RUNNER = "saleor.tests.runner.PytestTestRunner"
-
-
 PLAYGROUND_ENABLED = get_bool_from_env("PLAYGROUND_ENABLED", True)
 
 ALLOWED_HOSTS = get_list(os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1"))

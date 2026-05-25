@@ -15,7 +15,7 @@ from django.db import DEFAULT_DB_ALIAS
 from django.utils.text import capfirst
 
 from ...models import User
-from ...tests.fixtures.user import dangerously_get_or_create_superuser
+from ...utils import get_or_create_superuser
 
 
 class NotRunningInTTYException(Exception):
@@ -221,7 +221,7 @@ class Command(BaseCommand):
                     field = User._meta.get_field(field_name)
                     user_data[field_name] = field.clean(value, None)
 
-            _superuser, created = dangerously_get_or_create_superuser(**user_data)
+            _superuser, created = get_or_create_superuser(**user_data)
             if created:
                 self.stdout.write("Superuser created successfully.")
             else:

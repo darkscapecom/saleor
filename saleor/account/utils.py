@@ -8,6 +8,7 @@ from ..app.models import App
 from ..checkout import AddressType
 from ..core.tracing import traced_atomic_transaction
 from ..core.utils.events import call_event
+from ..permission.enums import get_permissions
 from ..permission.models import Permission
 from ..plugins.manager import get_plugins_manager
 from .lock_objects import user_qs_select_for_update
@@ -81,6 +82,35 @@ def store_user_address(
     elif address_type == AddressType.SHIPPING:
         if not user.default_shipping_address:
             set_user_default_shipping_address(user, address)
+
+
+def get_or_create_superuser(
+    email: str, password: str | None = None, **extra_fields
+) -> tuple[User, bool]:
+    if user := User.objects.filter(email=email).first():
+        return user, False
+
+    extra_fields.pop("username", None)
+    is_staff = extra_fields.pop("is_staff", True)
+    is_superuser = extra_fields.pop("is_superuser", True)
+    user = User(
+        email=User.objects.normalize_email(email),
+        is_active=True,
+        is_staff=is_staff,
+        is_superuser=is_superuser,
+        **extra_fields,
+    )
+    if password:
+        user.set_password(password)
+    else:
+        user.set_unusable_password()
+    user.save()
+
+    group, group_created = Group.objects.get_or_create(name="Full Access")
+    if group_created:
+        group.permissions.add(*get_permissions())
+    group.user_set.add(user)
+    return user, True
 
 
 def is_user_address_limit_reached(user: "User"):

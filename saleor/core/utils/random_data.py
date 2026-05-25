@@ -29,7 +29,6 @@ from ...account.models import Address, Group, User
 from ...account.search import (
     update_user_search_vector,
 )
-from ...account.tests.fixtures.user import dangerously_create_test_user
 from ...account.utils import store_user_address
 from ...app.models import App
 from ...attribute.models import (
@@ -44,9 +43,9 @@ from ...attribute.models import (
 )
 from ...channel.models import Channel
 from ...checkout import AddressType
+from ...core.exceptions import ProductNotPublished
 from ...checkout.fetch import fetch_checkout_info
-from ...checkout.models import Checkout
-from ...checkout.tests.utils import add_variant_to_checkout
+from ...checkout.models import Checkout, CheckoutLine
 from ...core.weight import zero_weight
 from ...discount import DiscountValueType, RewardValueType, VoucherType
 from ...discount.models import (
@@ -109,6 +108,7 @@ from ...site.models import SiteSettings
 from ...tax.models import TaxClass, TaxConfiguration
 from ...tax.utils import get_tax_class_kwargs_for_order_line
 from ...warehouse import WarehouseClickAndCollectOption
+from ...warehouse.availability import check_stock_and_preorder_quantity
 from ...warehouse.management import increase_stock
 from ...warehouse.models import PreorderAllocation, Stock, Warehouse
 from ..postgres import FlatConcatSearchVector
@@ -184,6 +184,24 @@ def _safe_child_path(base_path: str | os.PathLike, *parts: str) -> Path:
     child = base.joinpath(*parts).resolve(strict=True)
     child.relative_to(base)
     return child
+
+
+def create_sample_user(
+    email: str,
+    password: str | None = None,
+    is_staff: bool = False,
+    is_active: bool = True,
+    **extra_fields: Any,
+) -> User:
+    email = User.objects.normalize_email(email)
+    extra_fields.pop("username", None)
+    user = User(email=email, is_active=is_active, is_staff=is_staff, **extra_fields)
+    if password:
+        user.set_password(password)
+    else:
+        user.set_unusable_password()
+    user.save()
+    return user
 
 
 @lru_cache
@@ -1180,7 +1198,7 @@ def _create_staff_user(staff_password, email=None, superuser=False):
     if staff_user:
         return staff_user
 
-    staff_user = dangerously_create_test_user(
+    staff_user = create_sample_user(
         first_name=first_name,
         last_name=last_name,
         email=email,
@@ -1851,6 +1869,113 @@ def prepare_checkout_info():
         checkout, [], get_plugins_manager(allow_replica=False)
     )
     return checkout_info
+
+
+def check_variant_in_stock(
+    checkout: Checkout,
+    variant: ProductVariant,
+    channel_slug: str,
+    quantity: int = 1,
+    *,
+    calculate_stocks_with_shipping_zones: bool,
+    replace: bool = False,
+    check_quantity: bool = True,
+    checkout_lines: list[CheckoutLine] | None = None,
+    check_reservations: bool = False,
+) -> tuple[int, CheckoutLine | None]:
+    line = checkout.lines.filter(variant=variant).first()
+    line_quantity = 0 if line is None else line.quantity
+    new_quantity = quantity if replace else quantity + line_quantity
+
+    if new_quantity < 0:
+        raise ValueError(
+            f"{quantity!r} is not a valid quantity (results in {new_quantity!r})"
+        )
+
+    if new_quantity > 0 and check_quantity:
+        check_stock_and_preorder_quantity(
+            variant,
+            checkout.get_country(),
+            channel_slug,
+            new_quantity,
+            include_shipping_zones=calculate_stocks_with_shipping_zones,
+            checkout_lines=checkout_lines,
+            check_reservations=check_reservations,
+        )
+
+    return new_quantity, line
+
+
+def add_variant_to_checkout(
+    checkout_info,
+    variant: ProductVariant,
+    quantity: int = 1,
+    price_override: Decimal | None = None,
+    replace: bool = False,
+    check_quantity: bool = True,
+    force_new_line: bool = False,
+    calculate_stocks_with_shipping_zones: bool = True,
+):
+    checkout = checkout_info.checkout
+    channel_slug = checkout_info.channel.slug
+
+    product_channel_listing = ProductChannelListing.objects.filter(
+        channel_id=checkout.channel_id, product_id=variant.product_id
+    ).first()
+    if not product_channel_listing or not product_channel_listing.is_published:
+        raise ProductNotPublished()
+
+    variant_channel_listing = ProductVariantChannelListing.objects.get(
+        channel_id=checkout.channel_id, variant_id=variant.id
+    )
+    variant_price_amount = variant.get_base_price(
+        variant_channel_listing, price_override
+    ).amount
+    variant_prior_price_amount = variant.get_prior_price_amount(variant_channel_listing)
+
+    new_quantity, line = check_variant_in_stock(
+        checkout,
+        variant,
+        channel_slug,
+        quantity=quantity,
+        replace=replace,
+        check_quantity=check_quantity,
+        calculate_stocks_with_shipping_zones=calculate_stocks_with_shipping_zones,
+    )
+
+    if force_new_line:
+        checkout.lines.create(
+            variant=variant,
+            quantity=quantity,
+            price_override=price_override,
+            undiscounted_unit_price_amount=variant_price_amount,
+            prior_unit_price_amount=variant_prior_price_amount,
+        )
+        return checkout
+
+    if line is None:
+        line = checkout.lines.filter(variant=variant).first()
+
+    if new_quantity == 0:
+        if line is not None:
+            line.delete()
+    elif line is None:
+        checkout.lines.create(
+            variant=variant,
+            quantity=new_quantity,
+            currency=checkout.currency,
+            price_override=price_override,
+            undiscounted_unit_price_amount=variant_price_amount,
+            prior_unit_price_amount=variant_prior_price_amount,
+        )
+    elif new_quantity > 0:
+        line.quantity = new_quantity
+        line.save(update_fields=["quantity"])
+
+    price_expiration = timezone.now()
+    checkout.price_expiration = price_expiration
+    checkout.discount_expiration = price_expiration
+    return checkout
 
 
 def create_checkout_with_preorders():
